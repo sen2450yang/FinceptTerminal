@@ -31,6 +31,7 @@
 #include <QScrollBar>
 #include <QSizePolicy>
 #include <QTextOption>
+#include <QUuid>
 #include <memory>
 
 namespace fincept::screens {
@@ -117,6 +118,9 @@ AgentChatPanel::AgentChatPanel(QWidget* parent) : QWidget(parent) {
     e015_poll_timer_ = new QTimer(this);
     e015_poll_timer_->setInterval(60000);
     connect(e015_poll_timer_, &QTimer::timeout, this, [this]() { check_e015_version(); });
+    e015_task_timer_ = new QTimer(this);
+    e015_task_timer_->setInterval(1000);
+    connect(e015_task_timer_, &QTimer::timeout, this, &AgentChatPanel::poll_e015_task);
     connect(qApp, &QGuiApplication::applicationStateChanged, this,
             [this](Qt::ApplicationState) { sync_e015_polling(); });
 
@@ -495,11 +499,12 @@ void AgentChatPanel::build_ui() {
 // ── Event filter (Enter to send) ─────────────────────────────────────────────
 
 bool AgentChatPanel::eventFilter(QObject* obj, QEvent* event) {
-    if (obj == e015_plan_body_ && event->type() == QEvent::Resize) {
-        QTimer::singleShot(0, this, [this]() {
-            if (e015_plan_body_) {
-                e015_plan_body_->document()->setTextWidth(qMax(200, e015_plan_body_->viewport()->width()));
-                e015_plan_body_->setFixedHeight(qMax(48, static_cast<int>(e015_plan_body_->document()->size().height()) + 12));
+    if ((obj == e015_plan_body_ || obj->property("e015_answer").toBool()) && event->type() == QEvent::Resize) {
+        const QPointer<QTextEdit> body = qobject_cast<QTextEdit*>(obj);
+        QTimer::singleShot(0, this, [body]() {
+            if (body) {
+                body->document()->setTextWidth(qMax(200, body->viewport()->width()));
+                body->setFixedHeight(qMax(48, static_cast<int>(body->document()->size().height()) + 12));
             }
         });
     }
@@ -521,7 +526,7 @@ void AgentChatPanel::setup_connections() {
     connect(clear_btn_, &QPushButton::clicked, this, &AgentChatPanel::clear_chat);
     connect(agent_selector_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         if (!e015_selected())
-            stop_e015_requests();
+            stop_e015_requests(true);
         update_e015_controls();
         sync_e015_polling();
     });
@@ -840,6 +845,17 @@ void AgentChatPanel::sync_e015_polling() {
         return;
     }
     e015_poll_timer_->start();
+    if (!e015_pending_prompt_.isEmpty() && e015_task_id_.isEmpty() && !e015_plan_reply_ && !e015_control_reply_) {
+        const QString prompt = e015_pending_prompt_;
+        e015_pending_prompt_.clear();
+        submit_e015_manual(prompt);
+    }
+    if (!e015_task_id_.isEmpty()) {
+        if (e015_task_status_ == QStringLiteral("queued") || e015_task_status_ == QStringLiteral("running")) {
+            e015_task_timer_->start();
+            poll_e015_task();
+        }
+    }
     check_e015_version();
 }
 
@@ -847,12 +863,20 @@ void AgentChatPanel::stop_e015_requests(bool preserve_manual) {
     e015_version_unverified_ = true;
     if (e015_poll_timer_)
         e015_poll_timer_->stop();
-    // Losing focus or hiding the tab stops automatic work, but the user's
-    // explicitly submitted question and its version prerequisite may finish.
-    if (preserve_manual && !e015_manual_prompt_.isEmpty() && e015_selected() && e015_configured())
+    if (e015_task_timer_)
+        e015_task_timer_->stop();
+    // Keep the submission reply until its id arrives: aborting it could orphan
+    // server work. A hidden automatic task is cancelled as soon as its id arrives.
+    if ((!preserve_manual || e015_task_automatic_) && (!e015_task_id_.isEmpty() || e015_plan_reply_)) {
+        e015_task_cancel_requested_ = true;
+        if (!preserve_manual)
+            e015_task_discard_ = true;
+        control_e015_task(false);
+    }
+    if (preserve_manual && !e015_manual_prompt_.isEmpty() && e015_configured())
         return;
-    if (!preserve_manual)
-        e015_completed_manual_prompt_.clear();
+    if (e015_plan_reply_ && e015_task_cancel_requested_ && e015_task_id_.isEmpty())
+        return;
     const bool interrupted = e015_version_reply_ || e015_plan_reply_;
     if (e015_plan_reply_)
         e015_attempted_version_.clear(); // An interrupted request was never a completed attempt.
@@ -870,14 +894,18 @@ void AgentChatPanel::stop_e015_requests(bool preserve_manual) {
 }
 
 QNetworkReply* AgentChatPanel::start_e015_request(const QString& path, const QByteArray& body, bool manual) {
-    if (!e015_selected() || !e015_configured() ||
-        (!e015_active() && !(manual && !e015_manual_prompt_.isEmpty())))
+    const bool cancelling = path.endsWith(QStringLiteral("/cancel"));
+    const bool reconciling = body.isEmpty() && e015_task_uncertain_ && e015_task_cancel_requested_ &&
+                             path == QStringLiteral("/e015/tasks/") + e015_task_id_;
+    if ((!e015_selected() && !cancelling && !reconciling) || !e015_configured() ||
+        (!e015_active() && !(manual && !e015_manual_prompt_.isEmpty()) &&
+        !cancelling && !reconciling))
         return nullptr;
     QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:18769") + path));
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
     request.setRawHeader("Authorization", "Bearer " + ai_chat::LlmService::instance().active_api_key().toUtf8());
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    request.setTransferTimeout(125000);
+    request.setTransferTimeout(10000);
     auto* reply = body.isEmpty() ? e015_network_->get(request) : e015_network_->post(request, body);
     reply->setReadBufferSize(kE015ResponseLimit + 1);
     auto* timeout = new QTimer(reply);
@@ -886,7 +914,7 @@ QNetworkReply* AgentChatPanel::start_e015_request(const QString& path, const QBy
         reply->setProperty("e015_timeout", true);
         reply->abort();
     });
-    timeout->start(125000); // Absolute deadline also bounds continuously streaming replies.
+    timeout->start(10000); // Each task exchange is short; model work runs on the bridge.
     connect(reply, &QNetworkReply::metaDataChanged, reply, [reply]() {
         if (reply->header(QNetworkRequest::ContentLengthHeader).toLongLong() > kE015ResponseLimit) {
             reply->setProperty("e015_oversize", true);
@@ -919,9 +947,12 @@ static QString e015_reply_error(QNetworkReply* reply, const QJsonObject& object)
         message = QStringLiteral("请求超时");
     else if (http >= 300 && http < 400)
         message = QStringLiteral("本地桥接重定向已拒绝");
-    else if (reply->error() != QNetworkReply::NoError || http != 200)
-        message = QStringLiteral("HTTP %1：%2").arg(http).arg(object.value("error").toObject().value("message").toString(
-            QStringLiteral("本地桥接请求失败")));
+    else if (reply->error() != QNetworkReply::NoError || (http != 200 && http != 202)) {
+        const auto error = object.value("error");
+        const QString detail = error.isString() ? error.toString() :
+                               error.toObject().value("message").toString(QStringLiteral("本地桥接请求失败"));
+        message = QStringLiteral("HTTP %1：%2").arg(http).arg(detail);
+    }
     const QString token = ai_chat::LlmService::instance().active_api_key();
     if (!token.isEmpty())
         message.replace(token, QStringLiteral("[已隐藏]"));
@@ -956,7 +987,7 @@ void AgentChatPanel::check_e015_version(bool manual) {
             !object.value("no_account_writes").toBool()) {
             e015_version_unverified_ = true;
             const QString message = error.isEmpty() ? tr("E015 版本响应无效，当前计划待核验。") : error;
-            if (!e015_plan_reply_ && !e015_manual_prompt_.isEmpty())
+            if (!e015_plan_reply_ && e015_task_id_.isEmpty() && !e015_manual_prompt_.isEmpty())
                 fail_e015_manual(message + tr("；问题已恢复到输入框，可重新发送。"));
             else
                 show_e015_status(message, true);
@@ -973,16 +1004,7 @@ void AgentChatPanel::check_e015_version(bool manual) {
             show_e015_status(tr("数据变化，正在更新"), true);
             e015_refresh_deferred_ = true;
         }
-        if (!e015_plan_reply_) {
-            if (e015_active() && !e015_completed_manual_prompt_.isEmpty()) {
-                if (e015_last_plan_.value("version").toString() == version) {
-                    display_e015_plan(e015_last_plan_);
-                    return;
-                }
-                e015_manual_prompt_ = e015_completed_manual_prompt_;
-                e015_completed_manual_prompt_.clear();
-                e015_manual_stale_retried_ = true;
-            }
+        if (!e015_plan_reply_ && e015_task_id_.isEmpty()) {
             if (!e015_manual_prompt_.isEmpty())
                 request_e015_plan(false);
             else if (e015_active() && e015_attempted_version_ != e015_version_)
@@ -994,86 +1016,434 @@ void AgentChatPanel::check_e015_version(bool manual) {
 }
 
 void AgentChatPanel::request_e015_plan(bool automatic) {
-    if (!e015_selected() || !e015_configured() || e015_plan_reply_ || e015_version_.isEmpty() ||
-        (automatic ? !e015_active() : e015_manual_prompt_.isEmpty()))
+    if (!e015_selected() || !e015_configured() || e015_plan_reply_ || !e015_task_id_.isEmpty() ||
+        e015_version_.isEmpty() || (automatic ? !e015_active() : e015_manual_prompt_.isEmpty()))
         return;
-    const QString version = e015_version_;
+    if (e015_task_request_id_.isEmpty()) {
+        e015_task_request_id_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ++e015_task_epoch_;
+        e015_task_create_attempts_ = 0;
+        e015_task_version_ = e015_version_;
+        e015_task_automatic_ = automatic;
+        e015_task_cancel_requested_ = false;
+        e015_task_discard_ = false;
+        e015_task_uncertain_ = false;
+        e015_task_control_attempts_ = 0;
+    }
+    const QString request_id = e015_task_request_id_;
     const QString prompt = automatic ? tr("根据最新已登记持仓和资金，给出当前可执行与后续分步计划；保持原批次和追加计划顺序。")
                                      : e015_manual_prompt_;
-    const QJsonObject body{{"prompt", prompt}, {"expected_version", version}, {"automatic", automatic}};
-    auto* reply = start_e015_request(QStringLiteral("/e015/plan"), QJsonDocument(body).toJson(QJsonDocument::Compact),
+    const QJsonObject body{{"prompt", prompt}, {"expected_version", e015_task_version_},
+                          {"automatic", automatic}, {"request_id", request_id}};
+    auto* reply = start_e015_request(QStringLiteral("/e015/tasks"), QJsonDocument(body).toJson(QJsonDocument::Compact),
                                      !automatic);
     if (!reply)
         return;
+    ++e015_task_create_attempts_;
     e015_plan_reply_ = reply;
-    e015_attempted_version_ = version;
+    e015_attempted_version_ = e015_task_version_;
     e015_refresh_deferred_ = false;
-    if (!automatic)
-        set_executing(true);
-    show_e015_status(automatic ? tr("数据变化，正在更新") : tr("正在生成 E015 计划"));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, automatic, version, prompt]() {
+    show_e015_status(automatic ? tr("正在提交自动计划任务") : tr("正在提交 E015 研究任务"));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, request_id, automatic]() {
         reply->deleteLater();
         if (e015_plan_reply_ != reply)
             return;
         e015_plan_reply_ = nullptr;
-        if (!e015_selected() || !e015_configured() || (automatic && !e015_active()) ||
-            (!automatic && e015_manual_prompt_ != prompt))
+        if (request_id != e015_task_request_id_) {
+            // A confirmed cancellation may have accepted the saved follow-up
+            // while this old POST was finishing. Release its slot immediately.
+            if (!e015_manual_prompt_.isEmpty() && e015_task_id_.isEmpty())
+                check_e015_version(true);
+            else if (e015_active() && !e015_task_discard_)
+                check_e015_version();
             return;
+        }
         QJsonParseError parse_error;
         const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
         const auto object = doc.object();
         const QString error = e015_reply_error(reply, object);
+        const QString id = object.value("id").toString();
         const QString status = object.value("status").toString();
-        const bool stale = status == QStringLiteral("stale") || version != e015_version_ ||
-                           object.value("version").toString() != e015_version_ ||
-                           (!object.value("latest_version").toString().isEmpty() &&
-                            object.value("latest_version").toString() != e015_version_);
-        if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
-            const QString message = error.isEmpty() ? tr("E015 计划响应无效。") : error;
+        const QStringList valid_states{QStringLiteral("queued"), QStringLiteral("running"), QStringLiteral("completed"),
+                                       QStringLiteral("paused"), QStringLiteral("failed"), QStringLiteral("cancelled")};
+        if (status == QStringLiteral("stale") && !e015_task_discard_) {
+            e015_task_request_id_.clear();
+            e015_attempted_version_.clear();
+            if (!automatic && e015_manual_stale_retried_) {
+                fail_e015_manual(tr("数据连续变化，重试后源版本仍已过期；问题已恢复到输入框。"));
+            } else {
+                if (!automatic)
+                    e015_manual_stale_retried_ = true;
+                show_e015_status(tr("提交时源数据已变化；正在核验最新版本并重试"), true);
+                check_e015_version(!automatic);
+            }
+            return;
+        }
+        if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject() ||
+            id != request_id || !QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,128}$")).match(id).hasMatch() ||
+            !valid_states.contains(status)) {
+            // An uncertain timeout is retried with the same request id, never a
+            // fresh task. Authentication and invalid responses fail immediately.
+            const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const bool uncertain = http == 0 || http >= 500 || (http >= 200 && http < 300);
+            if (uncertain && !e015_task_discard_ && e015_task_create_attempts_ < 3 &&
+                (!automatic || e015_active())) {
+                show_e015_status(tr("提交连接中断；正在核对同一任务"));
+                QTimer::singleShot(1000, this, [this, automatic, request_id]() {
+                    if (request_id == e015_task_request_id_)
+                        request_e015_plan(automatic);
+                });
+                return;
+            }
+            if (uncertain || e015_task_discard_ || (automatic && !e015_active())) {
+                // Keep the UUID after uncertain creation. Only GET or cancel
+                // may reconcile it; a fresh send must not duplicate server work.
+                e015_task_id_ = request_id;
+                e015_task_uncertain_ = true;
+                e015_task_status_ = QStringLiteral("queued");
+                e015_task_poll_failures_ = 0;
+                if (!e015_task_discard_)
+                    show_e015_status(tr("提交结果未确认；正在核对原任务，请保留此问题。"));
+                if (e015_task_cancel_requested_ || (automatic && !e015_active())) {
+                    e015_task_cancel_requested_ = true;
+                    control_e015_task(false);
+                } else if (e015_active()) {
+                    e015_task_timer_->start();
+                    poll_e015_task();
+                }
+                return;
+            }
+            e015_task_request_id_.clear();
+            const QString message = error.isEmpty() ? tr("E015 任务响应无效。") : error;
             if (automatic)
                 show_e015_status(message, true);
             else
                 fail_e015_manual(message + tr("；问题已恢复到输入框，可重新发送。"));
-        } else if (stale) {
-            if (!automatic && e015_manual_stale_retried_) {
-                fail_e015_manual(tr("数据连续变化，重试后计划仍已过期；问题已恢复到输入框，请重新发送。"));
-            } else {
-                if (!automatic)
-                    e015_manual_stale_retried_ = true;
-                show_e015_status(tr("计划版本已过期；正在核验最新数据并重试"), true);
-                check_e015_version(!automatic);
+            return;
+        }
+        e015_task_id_ = id;
+        e015_task_uncertain_ = false;
+        e015_task_status_ = status;
+        e015_task_started_ = QDateTime::currentMSecsSinceEpoch();
+        e015_task_poll_failures_ = 0;
+        if (!e015_task_discard_)
+            display_e015_task(object);
+        if (status == QStringLiteral("completed")) {
+            if (!e015_task_discard_)
+                finish_e015_task(object.value("result").toObject());
+            else {
+                e015_task_id_.clear();
+                e015_task_request_id_.clear();
             }
-        } else if (status == QStringLiteral("current") || status == QStringLiteral("ai_unavailable")) {
-            if (object.value("engine_text").toString().trimmed().isEmpty()) {
-                if (automatic)
-                    show_e015_status(tr("缺少确定性引擎计划，当前计划不可用。"), true);
-                else
-                    fail_e015_manual(tr("缺少确定性引擎计划；问题已恢复到输入框，可重新发送。"));
+        } else if (e015_task_cancel_requested_ || (automatic && !e015_active())) {
+            control_e015_task(false);
+        } else if (e015_active() && (status == QStringLiteral("queued") || status == QStringLiteral("running"))) {
+            e015_task_timer_->start();
+            poll_e015_task();
+        } else if (status != QStringLiteral("queued") && status != QStringLiteral("running")) {
+            set_executing(false);
+        }
+    });
+}
+
+void AgentChatPanel::poll_e015_task() {
+    const bool reconcile_cancel = e015_task_uncertain_ && e015_task_cancel_requested_;
+    if ((!e015_active() && !reconcile_cancel) || !e015_configured() || e015_task_id_.isEmpty() ||
+        e015_plan_reply_ || e015_control_reply_)
+        return;
+    const QString id = e015_task_id_;
+    const quint64 epoch = e015_task_epoch_;
+    auto* reply = start_e015_request(QStringLiteral("/e015/tasks/") + id, {}, !e015_task_automatic_);
+    if (!reply)
+        return;
+    e015_plan_reply_ = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, id, epoch]() {
+        reply->deleteLater();
+        if (e015_plan_reply_ != reply)
+            return;
+        e015_plan_reply_ = nullptr;
+        if (epoch != e015_task_epoch_) {
+            if (e015_task_id_.isEmpty() && !e015_manual_prompt_.isEmpty())
+                check_e015_version(true);
+            return;
+        }
+        if (id != e015_task_id_) {
+            if (!e015_manual_prompt_.isEmpty() && e015_task_id_.isEmpty())
+                check_e015_version(true);
+            return;
+        }
+        QJsonParseError parse_error;
+        const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
+        const auto object = doc.object();
+        const QString error = e015_reply_error(reply, object);
+        if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject() ||
+            object.value("id").toString() != id) {
+            if (++e015_task_poll_failures_ >= 3) {
+                e015_task_timer_->stop();
+                e015_task_status_ = QStringLiteral("paused");
+                set_executing(false);
+                if (!e015_task_discard_) {
+                    show_e015_status(tr("任务连接中断；可继续核对同一任务。%1").arg(error));
+                    e015_resume_btn_->setEnabled(true);
+                }
+            } else if (e015_task_uncertain_ && e015_task_cancel_requested_ && !e015_active()) {
+                QTimer::singleShot(1000, this, [this, id, epoch]() {
+                    if (id == e015_task_id_ && epoch == e015_task_epoch_)
+                        poll_e015_task();
+                });
+            }
+            return;
+        }
+        e015_task_poll_failures_ = 0;
+        e015_task_uncertain_ = false;
+        if (e015_task_cancel_requested_) {
+            control_e015_task(false);
+            return;
+        }
+        display_e015_task(object);
+        const QString status = e015_task_status_;
+        if (status == QStringLiteral("completed")) {
+            e015_task_timer_->stop();
+            finish_e015_task(object.value("result").toObject());
+        } else if (status == QStringLiteral("failed") || status == QStringLiteral("cancelled") ||
+                   status == QStringLiteral("paused")) {
+            e015_task_timer_->stop();
+            set_executing(false);
+        } else if (status != QStringLiteral("queued") && status != QStringLiteral("running")) {
+            e015_task_timer_->stop();
+            e015_task_status_ = QStringLiteral("paused");
+            set_executing(false);
+            show_e015_status(tr("任务状态无效；可继续核对同一任务。"));
+            e015_resume_btn_->setEnabled(true);
+        }
+    });
+}
+
+void AgentChatPanel::control_e015_task(bool resume) {
+    // request_id is also the task id, so an uncertain POST can be cancelled
+    // without retrying creation while the window is hidden.
+    const QString id = e015_task_id_.isEmpty() ? e015_task_request_id_ : e015_task_id_;
+    if (id.isEmpty() || e015_control_reply_ || !e015_configured() || (resume && !e015_active()))
+        return;
+    if (resume && e015_task_uncertain_) {
+        e015_task_poll_failures_ = 0;
+        e015_task_status_ = QStringLiteral("queued");
+        e015_task_timer_->start();
+        poll_e015_task();
+        return;
+    }
+    auto* reply = start_e015_request(QStringLiteral("/e015/tasks/") + id +
+                                   (resume ? QStringLiteral("/resume") : QStringLiteral("/cancel")),
+                                   QByteArrayLiteral("{}"), !e015_task_automatic_);
+    if (!reply)
+        return;
+    const quint64 epoch = ++e015_task_epoch_;
+    if (resume && !e015_task_discard_)
+        e015_task_cancel_requested_ = false;
+    e015_control_reply_ = reply;
+    ++e015_task_control_attempts_;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, id, resume, epoch]() {
+        reply->deleteLater();
+        if (e015_control_reply_ != reply)
+            return;
+        e015_control_reply_ = nullptr;
+        if (epoch != e015_task_epoch_)
+            return;
+        if (id != e015_task_id_ && id != e015_task_request_id_)
+            return;
+        QJsonParseError parse_error;
+        const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
+        const auto object = doc.object();
+        const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (!resume && (http == 404 || object.value("status").toString() == QStringLiteral("not_found"))) {
+            // Cancellation can beat the original POST to the bridge. Retain its
+            // UUID and let that POST finish; otherwise reconcile through GET.
+            e015_task_cancel_requested_ = true;
+            if (e015_plan_reply_ && e015_plan_reply_->operation() == QNetworkAccessManager::PostOperation) {
+                e015_task_control_attempts_ = 0;
                 return;
             }
-            if (!automatic) {
-                e015_manual_prompt_.clear();
-                e015_manual_stale_retried_ = false;
-                set_executing(false);
-            }
-            if (!automatic && !e015_active()) {
-                e015_last_plan_ = object;
-                e015_completed_manual_prompt_ = prompt;
-                e015_version_unverified_ = true;
-                show_e015_status(tr("计划已生成；返回窗口后核验最新数据。"), true);
+            e015_task_id_ = id;
+            e015_task_uncertain_ = true;
+            if (!e015_task_discard_)
+                show_e015_status(tr("原任务尚未确认；保留任务编号继续核对。"));
+            poll_e015_task();
+            return;
+        }
+        QString error = e015_reply_error(reply, object);
+        if (error.isEmpty() && (parse_error.error != QJsonParseError::NoError || !doc.isObject() ||
+                                object.value("id").toString() != id))
+            error = tr("任务操作响应无效");
+        if (resume && (e015_task_discard_ || e015_task_cancel_requested_)) {
+            // Clear/focus loss may request cancellation during this resume POST,
+            // including an ambiguous resume timeout. Cancel before polling.
+            e015_task_cancel_requested_ = true;
+            e015_task_control_attempts_ = 0;
+            control_e015_task(false);
+            return;
+        }
+        if (!error.isEmpty()) {
+            if (!e015_task_discard_)
+                show_e015_status(tr("任务操作未确认：%1").arg(error));
+            if (!resume && e015_task_cancel_requested_ && e015_task_control_attempts_ < 3)
+                QTimer::singleShot(1000, this, [this, id]() {
+                    if ((id == e015_task_id_ || id == e015_task_request_id_) && e015_task_cancel_requested_)
+                        control_e015_task(false);
+                });
+            return;
+        }
+        e015_task_uncertain_ = false;
+        if (object.value("status").toString() == QStringLiteral("completed")) {
+            e015_task_timer_->stop();
+            if (!e015_task_discard_) {
+                display_e015_task(object);
+                finish_e015_task(object.value("result").toObject());
             } else {
-                display_e015_plan(object);
+                e015_task_id_.clear();
+                e015_task_request_id_.clear();
+            }
+            return;
+        }
+        if (resume) {
+            e015_task_cancel_requested_ = false;
+            e015_task_control_attempts_ = 0;
+            e015_task_started_ = QDateTime::currentMSecsSinceEpoch();
+            e015_task_poll_failures_ = 0;
+            e015_task_status_ = QStringLiteral("queued");
+            if (!e015_task_automatic_)
+                set_executing(true);
+            if (e015_active()) {
+                e015_task_timer_->start();
+                poll_e015_task();
             }
         } else {
-            if (automatic)
-                show_e015_status(tr("E015 计划状态无效。"), true);
-            else
-                fail_e015_manual(tr("E015 计划状态无效；问题已恢复到输入框，可重新发送。"));
+            e015_task_timer_->stop();
+            e015_task_status_ = QStringLiteral("cancelled");
+            set_executing(false);
+            if (!e015_task_discard_) {
+                show_e015_status(tr("任务已暂停，可继续研究"));
+                e015_cancel_btn_->setEnabled(false);
+                e015_resume_btn_->setEnabled(true);
+            }
+            if ((e015_task_automatic_ && e015_task_cancel_requested_) || e015_task_discard_) {
+                e015_task_id_.clear();
+                e015_task_request_id_.clear();
+                e015_attempted_version_.clear();
+                if (!e015_pending_prompt_.isEmpty() && e015_selected() && e015_configured()) {
+                    const QString prompt = e015_pending_prompt_;
+                    e015_pending_prompt_.clear();
+                    submit_e015_manual(prompt);
+                } else if (e015_active() && !e015_task_discard_) {
+                    check_e015_version();
+                }
+            }
         }
-        if (e015_active() && e015_manual_prompt_.isEmpty() && e015_refresh_deferred_ &&
-            !e015_version_reply_ && e015_attempted_version_ != e015_version_)
-            request_e015_plan(true);
     });
+}
+
+void AgentChatPanel::display_e015_task(const QJsonObject& task) {
+    e015_task_status_ = task.value("status").toString();
+    const QString state = e015_task_status_;
+    const QString state_text = state == QStringLiteral("queued") ? tr("等待处理") :
+                               state == QStringLiteral("running") ? tr("正在研究") :
+                               state == QStringLiteral("completed") ? tr("研究完成") :
+                               state == QStringLiteral("failed") ? tr("研究失败") : tr("研究已暂停");
+    QStringList lines{tr("%1 · %2").arg(state_text, task.value("phase").toString()),
+                      tr("任务源版本：%1").arg(task.value("version").toString(e015_task_version_))};
+    for (const auto& item : task.value("steps").toArray()) {
+        const auto step = item.toObject();
+        const QString step_status = step.value("status").toString();
+        const QString marker = step_status == QStringLiteral("completed") ? QStringLiteral("✓") :
+                               step_status == QStringLiteral("running") ? QStringLiteral("…") :
+                               step_status == QStringLiteral("failed") ? QStringLiteral("!") : QStringLiteral("·");
+        lines.append(QStringLiteral("%1 %2 %3").arg(marker, step.value("name").toString(),
+                                                     step.value("summary").toString()));
+    }
+    QString error = task.value("error").toString();
+    const QString token = ai_chat::LlmService::instance().active_api_key();
+    if (!token.isEmpty())
+        error.replace(token, QStringLiteral("[已隐藏]"));
+    if (!error.isEmpty())
+        lines.append(tr("任务错误：%1").arg(error.left(400)));
+    if (state == QStringLiteral("running") && QDateTime::currentMSecsSinceEpoch() - e015_task_started_ > 180000)
+        lines.append(tr("研究超过 3 分钟，仍在核对步骤；可暂停并稍后继续。"));
+    const QString progress = lines.join(QStringLiteral("\n"));
+    show_e015_status(state_text);
+    if (!e015_task_automatic_ && e015_manual_body_)
+        e015_manual_body_->setPlainText(progress);
+    else if (e015_plan_body_)
+        e015_plan_body_->setPlainText(progress);
+    const bool active = state == QStringLiteral("queued") || state == QStringLiteral("running");
+    e015_cancel_btn_->setEnabled(active);
+    e015_resume_btn_->setEnabled(!active && state != QStringLiteral("completed"));
+}
+
+void AgentChatPanel::finish_e015_task(const QJsonObject& plan) {
+    const bool automatic = e015_task_automatic_;
+    e015_task_id_.clear();
+    e015_task_request_id_.clear();
+    e015_task_uncertain_ = false;
+    if (automatic && !e015_pending_prompt_.isEmpty()) {
+        if (e015_selected() && e015_configured()) {
+            const QString prompt = e015_pending_prompt_;
+            e015_pending_prompt_.clear();
+            submit_e015_manual(prompt);
+        } else {
+            set_executing(false);
+        }
+        return;
+    }
+    const QString version = plan.value("version").toString();
+    const QString status = plan.value("status").toString();
+    const bool stale = status == QStringLiteral("stale") || version != e015_version_ ||
+                       (!plan.value("latest_version").toString().isEmpty() &&
+                        plan.value("latest_version").toString() != e015_version_);
+    if (stale) {
+        if (!automatic && e015_manual_stale_retried_) {
+            fail_e015_manual(tr("数据连续变化，重试后答案仍已过期；问题已恢复到输入框。"));
+        } else {
+            if (!automatic)
+                e015_manual_stale_retried_ = true;
+            e015_attempted_version_.clear();
+            show_e015_status(tr("源数据已变化；正在核验最新版本并重试"), true);
+            check_e015_version(!automatic);
+        }
+        return;
+    }
+    if ((status != QStringLiteral("current") && status != QStringLiteral("ai_unavailable")) ||
+        !plan.value("no_orders_sent").toBool() || !plan.value("no_account_writes").toBool() ||
+        plan.value("engine_text").toString().trimmed().isEmpty()) {
+        if (automatic)
+            show_e015_status(tr("缺少有效确定性引擎计划，当前计划不可用。"), true);
+        else
+            fail_e015_manual(tr("缺少有效确定性引擎计划；问题已恢复到输入框。"));
+        return;
+    }
+    if (automatic) {
+        display_e015_plan(plan);
+    } else {
+        QString answer = tr("源版本：%1 · 数据时间：%2\n\n")
+                             .arg(version, plan.value("generated_at").toString());
+        answer += plan.value("engine_text").toString();
+        const QString assistant = plan.value("assistant_text").toString();
+        if (!assistant.isEmpty())
+            answer += tr("\n\n## AI 解释\n\n") + assistant;
+        for (const auto& warning : plan.value("warnings").toArray())
+            if (warning.isString())
+                answer += QStringLiteral("\n\n") + warning.toString();
+        if (e015_manual_body_)
+            e015_manual_body_->setHtml(e015_markdown(answer));
+        e015_manual_body_ = nullptr;
+        e015_manual_prompt_.clear();
+        e015_manual_stale_retried_ = false;
+        set_executing(false);
+        show_e015_status(tr("研究回答已保留 · 源版本：%1").arg(version));
+        scroll_to_bottom();
+    }
+    e015_cancel_btn_->setEnabled(false);
+    e015_resume_btn_->setEnabled(false);
+    if (e015_active() && e015_refresh_deferred_ && !e015_version_reply_ && e015_attempted_version_ != e015_version_)
+        request_e015_plan(true);
 }
 
 void AgentChatPanel::fail_e015_manual(const QString& text) {
@@ -1088,6 +1458,9 @@ void AgentChatPanel::fail_e015_manual(const QString& text) {
         else if (draft.trimmed() != prompt)
             input_edit_->setPlainText(draft + QStringLiteral("\n\n") + prompt);
     }
+    if (e015_manual_body_)
+        e015_manual_body_->setPlainText(text);
+    e015_manual_body_ = nullptr;
     set_executing(false);
     show_e015_status(text, true);
     reveal_e015_plan();
@@ -1124,9 +1497,10 @@ void AgentChatPanel::show_e015_status(const QString& text, bool invalidate) {
         };
         connect(body->document(), &QTextDocument::contentsChanged, body, resize_body);
         layout->addWidget(label);
-        auto* shortcuts = new QHBoxLayout;
+        auto* shortcuts = new QGridLayout;
         shortcuts->setSpacing(8);
-        const auto add_shortcut = [this, shortcuts](const QString& title, const QString& prompt) {
+        int shortcut_index = 0;
+        const auto add_shortcut = [this, shortcuts, &shortcut_index](const QString& title, const QString& prompt) {
             auto* button = new QPushButton(title);
             button->setMinimumHeight(32);
             button->setCursor(Qt::PointingHandCursor);
@@ -1143,14 +1517,38 @@ void AgentChatPanel::show_e015_status(const QString& text, bool invalidate) {
                 send_message();
                 input_edit_->setPlainText(draft);
             });
-            shortcuts->addWidget(button);
+            shortcuts->addWidget(button, shortcut_index / 4, shortcut_index % 4);
+            ++shortcut_index;
         };
         add_shortcut(tr("持仓"), QStringLiteral("查看全部持仓"));
         add_shortcut(tr("规则"), QStringLiteral("查看策略规则"));
         add_shortcut(tr("批次投后"), QStringLiteral("查看批次投后金额"));
         add_shortcut(tr("交易记录"), QStringLiteral("查看交易记录"));
-        shortcuts->addStretch();
+        add_shortcut(tr("变化核对"), QStringLiteral("查看与上次决策的变化"));
+        add_shortcut(tr("情景比较"), QStringLiteral("使用情景比较工具比较等待、部分执行、延迟执行和渠道选择，说明风险与约束"));
+        add_shortcut(tr("压力分析"), QStringLiteral("使用风险工具分析实际指数区别、资料覆盖和明确假设的压力情景，说明每批完成后的风险变化"));
+        add_shortcut(tr("研究比较"), QStringLiteral("比较 E015 与 F009 的冻结研究证据"));
+        add_shortcut(tr("决策历史"), QStringLiteral("查看决策历史"));
         layout->addLayout(shortcuts);
+        auto* task_controls = new QHBoxLayout;
+        e015_cancel_btn_ = new QPushButton(tr("暂停研究"));
+        e015_resume_btn_ = new QPushButton(tr("继续研究"));
+        for (auto* button : {e015_cancel_btn_.data(), e015_resume_btn_.data()}) {
+            button->setMinimumHeight(32);
+            button->setCursor(Qt::PointingHandCursor);
+            button->setEnabled(false);
+            task_controls->addWidget(button);
+        }
+        task_controls->addStretch();
+        connect(e015_cancel_btn_.data(), &QPushButton::clicked, this, [this]() {
+            e015_task_control_attempts_ = 0;
+            control_e015_task(false);
+        });
+        connect(e015_resume_btn_.data(), &QPushButton::clicked, this, [this]() {
+            e015_task_control_attempts_ = 0;
+            control_e015_task(true);
+        });
+        layout->addLayout(task_controls);
         layout->addWidget(body);
         messages_layout_->insertWidget(messages_layout_->count() - 1, panel);
         e015_plan_panel_ = panel;
@@ -1183,12 +1581,34 @@ void AgentChatPanel::display_e015_plan(const QJsonObject& plan) {
         show_e015_status(tr("缺少确定性引擎计划，当前计划不可用。"), true);
         return;
     }
-    e015_completed_manual_prompt_.clear();
     e015_last_plan_ = plan;
     const QString assistant = plan.value("assistant_text").toString();
     e015_plan_body_->setHtml(e015_markdown(tr("## E015 确定性执行计划\n\n") + engine +
                                          (assistant.isEmpty() ? QString{} : tr("\n\n## AI 解释\n\n") + assistant)));
     reveal_e015_plan();
+}
+
+void AgentChatPanel::submit_e015_manual(const QString& text) {
+    e015_task_request_id_.clear();
+    e015_task_discard_ = false;
+    e015_task_cancel_requested_ = false;
+    e015_task_automatic_ = false;
+    e015_manual_prompt_ = text;
+    e015_manual_stale_retried_ = false;
+    add_user_bubble(text);
+    e015_manual_body_ = add_streaming_bubble(tr("E015 研究回答"));
+    e015_manual_body_->setProperty("e015_answer", true);
+    e015_manual_body_->installEventFilter(this);
+    e015_manual_body_->setPlainText(tr("正在核验数据并准备研究…"));
+    set_executing(true);
+    show_e015_status(tr("正在核验 E015 数据"));
+    messages_layout_->removeWidget(e015_plan_panel_);
+    messages_layout_->insertWidget(messages_layout_->count() - 1, e015_plan_panel_);
+    reveal_e015_plan();
+    if (e015_version_.isEmpty() || e015_version_unverified_)
+        check_e015_version(true);
+    else
+        request_e015_plan(false);
 }
 
 // ── send_message ─────────────────────────────────────────────────────────────
@@ -1203,26 +1623,34 @@ void AgentChatPanel::send_message() {
             show_e015_status(tr("E015 仅在窗口激活时使用已认证的本地桥接；请检查模型、地址和令牌。"), true);
             return;
         }
-        // An explicit follow-up supersedes an automatic refresh, preserving the draft.
-        if (e015_plan_reply_) {
-            auto* reply = e015_plan_reply_.data();
-            e015_plan_reply_ = nullptr;
-            reply->abort();
+        if (e015_task_uncertain_) {
+            show_e015_status(tr("上一任务的提交结果仍待核对；请继续原任务后再发送新问题。"));
+            e015_task_poll_failures_ = 0;
+            e015_task_timer_->start();
+            poll_e015_task();
+            return;
         }
-        e015_manual_prompt_ = text;
-        e015_completed_manual_prompt_.clear();
-        e015_manual_stale_retried_ = false;
-        add_user_bubble(text);
-        set_executing(true);
-        show_e015_status(tr("正在核验 E015 数据"));
-        messages_layout_->removeWidget(e015_plan_panel_);
-        messages_layout_->insertWidget(messages_layout_->count() - 1, e015_plan_panel_);
-        reveal_e015_plan();
+        // A follow-up cancels automatic work, then submits the user's saved
+        // prompt. Shortcut callers can restore their draft immediately.
+        if ((!e015_task_id_.isEmpty() || e015_plan_reply_) && e015_task_automatic_) {
+            e015_pending_prompt_ = text;
+            input_edit_->clear();
+            set_executing(true);
+            e015_task_cancel_requested_ = true;
+            e015_task_control_attempts_ = 0;
+            control_e015_task(false);
+            show_e015_status(tr("正在结束自动更新并准备研究问题"));
+            return;
+        }
+        if (!e015_task_id_.isEmpty()) {
+            // A terminal manual task stays resumable until the user asks a new
+            // question; its retained bubble is never repurposed.
+            e015_task_id_.clear();
+            e015_manual_prompt_.clear();
+            e015_manual_body_ = nullptr;
+        }
         input_edit_->clear();
-        if (e015_version_.isEmpty() || e015_version_unverified_)
-            check_e015_version(true);
-        else
-            request_e015_plan(false);
+        submit_e015_manual(text);
         return;
     }
 
@@ -1613,8 +2041,8 @@ void AgentChatPanel::show_typing(bool on) {
 
 void AgentChatPanel::clear_chat() {
     stop_e015_requests();
+    e015_pending_prompt_.clear();
     e015_manual_prompt_.clear();
-    e015_completed_manual_prompt_.clear();
     e015_manual_stale_retried_ = false;
     e015_attempted_version_.clear();
     e015_last_plan_ = {};
@@ -1622,6 +2050,9 @@ void AgentChatPanel::clear_chat() {
     e015_plan_panel_ = nullptr;
     e015_plan_status_ = nullptr;
     e015_plan_body_ = nullptr;
+    e015_manual_body_ = nullptr;
+    e015_cancel_btn_ = nullptr;
+    e015_resume_btn_ = nullptr;
     // Null streaming refs before deleting widgets
     streaming_bubble_widget_ = nullptr;
     streaming_text_.clear();
