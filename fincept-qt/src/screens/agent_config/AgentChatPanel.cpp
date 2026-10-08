@@ -790,6 +790,7 @@ void AgentChatPanel::update_e015_controls() {
         run_as_task_toggle_->setChecked(false);
         // Ignore any legacy agent completion after changing to this local brain.
         if (!pending_request_id_.isEmpty()) {
+            pending_request_id_.clear();
             show_typing(false);
             set_executing(false);
             streaming_bubble_widget_ = nullptr;
