@@ -46,7 +46,15 @@ static constexpr qint64 kE015ResponseLimit = 2 * 1024 * 1024;
 static QString e015_markdown(const QString& text) {
     auto html = ui::MarkdownRenderer::render(text.toHtmlEscaped());
     html.remove(QRegularExpression(QStringLiteral("<img\\b[^>]*>"), QRegularExpression::CaseInsensitiveOption));
-    html.replace(QStringLiteral("font-size:14px; margin:0"), QStringLiteral("font-size:16px; margin:0"));
+    html.replace(QStringLiteral("#e5e5e5"), col::TEXT_PRIMARY());
+    html.replace(QStringLiteral("#808080"), col::TEXT_SECONDARY());
+    html.replace(QStringLiteral("#111111"), col::BG_SURFACE());
+    html.replace(QStringLiteral("#0d0d0d"), col::BG_BASE());
+    html.replace(QStringLiteral("#1a1a1a"), col::BORDER_MED());
+    html.replace(QStringLiteral("#d97706"), col::AMBER());
+    html.replace(QStringLiteral("#f59e0b"), col::AMBER());
+    html.replace(QStringLiteral("font-size:14px"), QStringLiteral("font-size:16px"));
+    html.replace(QStringLiteral("font-size:13px"), QStringLiteral("font-size:14px"));
     return html;
 }
 
