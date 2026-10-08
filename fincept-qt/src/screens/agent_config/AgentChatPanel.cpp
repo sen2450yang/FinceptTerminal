@@ -116,7 +116,7 @@ AgentChatPanel::AgentChatPanel(QWidget* parent) : QWidget(parent) {
     e015_network_->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
     e015_poll_timer_ = new QTimer(this);
     e015_poll_timer_->setInterval(60000);
-    connect(e015_poll_timer_, &QTimer::timeout, this, &AgentChatPanel::check_e015_version);
+    connect(e015_poll_timer_, &QTimer::timeout, this, [this]() { check_e015_version(); });
     connect(qApp, &QGuiApplication::applicationStateChanged, this,
             [this](Qt::ApplicationState) { sync_e015_polling(); });
 
@@ -520,6 +520,8 @@ void AgentChatPanel::setup_connections() {
     connect(send_btn_, &QPushButton::clicked, this, &AgentChatPanel::send_message);
     connect(clear_btn_, &QPushButton::clicked, this, &AgentChatPanel::clear_chat);
     connect(agent_selector_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (!e015_selected())
+            stop_e015_requests();
         update_e015_controls();
         sync_e015_polling();
     });
@@ -585,8 +587,12 @@ void AgentChatPanel::setup_connections() {
             });
 
     // LLM config changes
-    connect(&ai_chat::LlmService::instance(), &ai_chat::LlmService::config_changed, this,
-            &AgentChatPanel::update_llm_status, Qt::UniqueConnection);
+    connect(&ai_chat::LlmService::instance(), &ai_chat::LlmService::config_changed, this, [this]() {
+        stop_e015_requests();
+        e015_version_.clear();
+        e015_attempted_version_.clear();
+        update_llm_status();
+    });
 
     // Streaming signals
     connect(&svc, &services::AgentService::agent_stream_thinking, this,
@@ -734,7 +740,7 @@ void AgentChatPanel::showEvent(QShowEvent* event) {
 
 void AgentChatPanel::hideEvent(QHideEvent* event) {
     QWidget::hideEvent(event);
-    stop_e015_requests();
+    stop_e015_requests(true);
 }
 
 // ── LLM status display ────────────────────────────────────────────────────────
@@ -825,7 +831,7 @@ void AgentChatPanel::sync_e015_polling() {
     if (!e015_poll_timer_)
         return;
     if (!e015_active()) {
-        stop_e015_requests();
+        stop_e015_requests(true);
         return;
     }
     if (!e015_configured()) {
@@ -837,10 +843,17 @@ void AgentChatPanel::sync_e015_polling() {
     check_e015_version();
 }
 
-void AgentChatPanel::stop_e015_requests() {
+void AgentChatPanel::stop_e015_requests(bool preserve_manual) {
     e015_version_unverified_ = true;
     if (e015_poll_timer_)
         e015_poll_timer_->stop();
+    // Losing focus or hiding the tab stops automatic work, but the user's
+    // explicitly submitted question and its version prerequisite may finish.
+    if (preserve_manual && !e015_manual_prompt_.isEmpty() && e015_selected() && e015_configured())
+        return;
+    if (!preserve_manual)
+        e015_completed_manual_prompt_.clear();
+    const bool interrupted = e015_version_reply_ || e015_plan_reply_;
     if (e015_plan_reply_)
         e015_attempted_version_.clear(); // An interrupted request was never a completed attempt.
     for (auto* slot : {&e015_version_reply_, &e015_plan_reply_}) {
@@ -851,11 +864,14 @@ void AgentChatPanel::stop_e015_requests() {
         }
     }
     if (!e015_manual_prompt_.isEmpty())
-        set_executing(false); // The queued prompt resumes on activation; the draft stays intact.
+        fail_e015_manual(tr("请求已取消；问题已恢复到输入框，可重新发送。"));
+    else if (interrupted && e015_selected())
+        show_e015_status(tr("自动更新已暂停；返回窗口后核验最新数据。"), true);
 }
 
-QNetworkReply* AgentChatPanel::start_e015_request(const QString& path, const QByteArray& body) {
-    if (!e015_active() || !e015_configured())
+QNetworkReply* AgentChatPanel::start_e015_request(const QString& path, const QByteArray& body, bool manual) {
+    if (!e015_selected() || !e015_configured() ||
+        (!e015_active() && !(manual && !e015_manual_prompt_.isEmpty())))
         return nullptr;
     QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:18769") + path));
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
@@ -912,15 +928,15 @@ static QString e015_reply_error(QNetworkReply* reply, const QJsonObject& object)
     return message.left(400);
 }
 
-void AgentChatPanel::check_e015_version() {
-    if (!e015_active() || e015_version_reply_)
+void AgentChatPanel::check_e015_version(bool manual) {
+    if ((!e015_active() && !(manual && !e015_manual_prompt_.isEmpty())) || e015_version_reply_)
         return;
     if (!e015_configured()) {
         stop_e015_requests();
         show_e015_status(tr("E015 本地桥接配置或认证令牌无效。"), true);
         return;
     }
-    auto* reply = start_e015_request(QStringLiteral("/e015/version"));
+    auto* reply = start_e015_request(QStringLiteral("/e015/version"), {}, manual);
     if (!reply)
         return;
     e015_version_reply_ = reply;
@@ -929,7 +945,7 @@ void AgentChatPanel::check_e015_version() {
         if (e015_version_reply_ != reply)
             return;
         e015_version_reply_ = nullptr;
-        if (!e015_active())
+        if (!e015_selected() || !e015_configured() || (!e015_active() && e015_manual_prompt_.isEmpty()))
             return;
         QJsonParseError parse_error;
         const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
@@ -939,9 +955,11 @@ void AgentChatPanel::check_e015_version() {
             object.value("version").toString().isEmpty() || !object.value("no_orders_sent").toBool() ||
             !object.value("no_account_writes").toBool()) {
             e015_version_unverified_ = true;
-            show_e015_status(error.isEmpty() ? tr("E015 版本响应无效，当前计划待核验。") : error, true);
-            if (!e015_plan_reply_)
-                set_executing(false);
+            const QString message = error.isEmpty() ? tr("E015 版本响应无效，当前计划待核验。") : error;
+            if (!e015_plan_reply_ && !e015_manual_prompt_.isEmpty())
+                fail_e015_manual(message + tr("；问题已恢复到输入框，可重新发送。"));
+            else
+                show_e015_status(message, true);
             return;
         }
         const QString version = object.value("version").toString();
@@ -956,24 +974,35 @@ void AgentChatPanel::check_e015_version() {
             e015_refresh_deferred_ = true;
         }
         if (!e015_plan_reply_) {
+            if (e015_active() && !e015_completed_manual_prompt_.isEmpty()) {
+                if (e015_last_plan_.value("version").toString() == version) {
+                    display_e015_plan(e015_last_plan_);
+                    return;
+                }
+                e015_manual_prompt_ = e015_completed_manual_prompt_;
+                e015_completed_manual_prompt_.clear();
+                e015_manual_stale_retried_ = true;
+            }
             if (!e015_manual_prompt_.isEmpty())
                 request_e015_plan(false);
-            else if (e015_attempted_version_ != e015_version_)
+            else if (e015_active() && e015_attempted_version_ != e015_version_)
                 request_e015_plan(true);
-            else if (restore_verified)
+            else if (e015_active() && restore_verified)
                 display_e015_plan(e015_last_plan_);
         }
     });
 }
 
 void AgentChatPanel::request_e015_plan(bool automatic) {
-    if (!e015_active() || !e015_configured() || e015_plan_reply_ || e015_version_.isEmpty())
+    if (!e015_selected() || !e015_configured() || e015_plan_reply_ || e015_version_.isEmpty() ||
+        (automatic ? !e015_active() : e015_manual_prompt_.isEmpty()))
         return;
     const QString version = e015_version_;
     const QString prompt = automatic ? tr("根据最新已登记持仓和资金，给出当前可执行与后续分步计划；保持原批次和追加计划顺序。")
                                      : e015_manual_prompt_;
     const QJsonObject body{{"prompt", prompt}, {"expected_version", version}, {"automatic", automatic}};
-    auto* reply = start_e015_request(QStringLiteral("/e015/plan"), QJsonDocument(body).toJson(QJsonDocument::Compact));
+    auto* reply = start_e015_request(QStringLiteral("/e015/plan"), QJsonDocument(body).toJson(QJsonDocument::Compact),
+                                     !automatic);
     if (!reply)
         return;
     e015_plan_reply_ = reply;
@@ -982,16 +1011,13 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
     if (!automatic)
         set_executing(true);
     show_e015_status(automatic ? tr("数据变化，正在更新") : tr("正在生成 E015 计划"));
-    connect(reply, &QNetworkReply::finished, this, [this, reply, automatic, version]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, automatic, version, prompt]() {
         reply->deleteLater();
         if (e015_plan_reply_ != reply)
             return;
         e015_plan_reply_ = nullptr;
-        if (!automatic) {
-            e015_manual_prompt_.clear();
-            set_executing(false);
-        }
-        if (!e015_active())
+        if (!e015_selected() || !e015_configured() || (automatic && !e015_active()) ||
+            (!automatic && e015_manual_prompt_ != prompt))
             return;
         QJsonParseError parse_error;
         const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
@@ -1003,17 +1029,74 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
                            (!object.value("latest_version").toString().isEmpty() &&
                             object.value("latest_version").toString() != e015_version_);
         if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
-            show_e015_status(error.isEmpty() ? tr("E015 计划响应无效。") : error, true);
+            const QString message = error.isEmpty() ? tr("E015 计划响应无效。") : error;
+            if (automatic)
+                show_e015_status(message, true);
+            else
+                fail_e015_manual(message + tr("；问题已恢复到输入框，可重新发送。"));
         } else if (stale) {
-            show_e015_status(tr("计划版本已过期；数据变化，正在更新"), true);
-            check_e015_version(); // Recheck once; unchanged failed inputs never trigger a retry loop.
+            if (!automatic && e015_manual_stale_retried_) {
+                fail_e015_manual(tr("数据连续变化，重试后计划仍已过期；问题已恢复到输入框，请重新发送。"));
+            } else {
+                if (!automatic)
+                    e015_manual_stale_retried_ = true;
+                show_e015_status(tr("计划版本已过期；正在核验最新数据并重试"), true);
+                check_e015_version(!automatic);
+            }
         } else if (status == QStringLiteral("current") || status == QStringLiteral("ai_unavailable")) {
-            display_e015_plan(object);
+            if (object.value("engine_text").toString().trimmed().isEmpty()) {
+                if (automatic)
+                    show_e015_status(tr("缺少确定性引擎计划，当前计划不可用。"), true);
+                else
+                    fail_e015_manual(tr("缺少确定性引擎计划；问题已恢复到输入框，可重新发送。"));
+                return;
+            }
+            if (!automatic) {
+                e015_manual_prompt_.clear();
+                e015_manual_stale_retried_ = false;
+                set_executing(false);
+            }
+            if (!automatic && !e015_active()) {
+                e015_last_plan_ = object;
+                e015_completed_manual_prompt_ = prompt;
+                e015_version_unverified_ = true;
+                show_e015_status(tr("计划已生成；返回窗口后核验最新数据。"), true);
+            } else {
+                display_e015_plan(object);
+            }
         } else {
-            show_e015_status(tr("E015 计划状态无效。"), true);
+            if (automatic)
+                show_e015_status(tr("E015 计划状态无效。"), true);
+            else
+                fail_e015_manual(tr("E015 计划状态无效；问题已恢复到输入框，可重新发送。"));
         }
-        if (e015_refresh_deferred_ && !e015_version_reply_ && e015_attempted_version_ != e015_version_)
+        if (e015_active() && e015_manual_prompt_.isEmpty() && e015_refresh_deferred_ &&
+            !e015_version_reply_ && e015_attempted_version_ != e015_version_)
             request_e015_plan(true);
+    });
+}
+
+void AgentChatPanel::fail_e015_manual(const QString& text) {
+    const QString prompt = e015_manual_prompt_;
+    e015_manual_prompt_.clear();
+    e015_manual_stale_retried_ = false;
+    e015_refresh_deferred_ = false;
+    if (!prompt.isEmpty()) {
+        const QString draft = input_edit_->toPlainText();
+        if (draft.trimmed().isEmpty())
+            input_edit_->setPlainText(prompt);
+        else if (draft.trimmed() != prompt)
+            input_edit_->setPlainText(draft + QStringLiteral("\n\n") + prompt);
+    }
+    set_executing(false);
+    show_e015_status(text, true);
+    reveal_e015_plan();
+}
+
+void AgentChatPanel::reveal_e015_plan() {
+    QTimer::singleShot(60, this, [this]() {
+        if (e015_plan_status_ && e015_active())
+            scroll_area_->ensureWidgetVisible(e015_plan_status_, 0, 12);
     });
 }
 
@@ -1100,11 +1183,12 @@ void AgentChatPanel::display_e015_plan(const QJsonObject& plan) {
         show_e015_status(tr("缺少确定性引擎计划，当前计划不可用。"), true);
         return;
     }
+    e015_completed_manual_prompt_.clear();
     e015_last_plan_ = plan;
     const QString assistant = plan.value("assistant_text").toString();
     e015_plan_body_->setHtml(e015_markdown(tr("## E015 确定性执行计划\n\n") + engine +
                                          (assistant.isEmpty() ? QString{} : tr("\n\n## AI 解释\n\n") + assistant)));
-    scroll_to_bottom();
+    reveal_e015_plan();
 }
 
 // ── send_message ─────────────────────────────────────────────────────────────
@@ -1126,11 +1210,17 @@ void AgentChatPanel::send_message() {
             reply->abort();
         }
         e015_manual_prompt_ = text;
+        e015_completed_manual_prompt_.clear();
+        e015_manual_stale_retried_ = false;
         add_user_bubble(text);
-        input_edit_->clear();
         set_executing(true);
-        if (e015_version_.isEmpty())
-            check_e015_version();
+        show_e015_status(tr("正在核验 E015 数据"));
+        messages_layout_->removeWidget(e015_plan_panel_);
+        messages_layout_->insertWidget(messages_layout_->count() - 1, e015_plan_panel_);
+        reveal_e015_plan();
+        input_edit_->clear();
+        if (e015_version_.isEmpty() || e015_version_unverified_)
+            check_e015_version(true);
         else
             request_e015_plan(false);
         return;
@@ -1524,6 +1614,8 @@ void AgentChatPanel::show_typing(bool on) {
 void AgentChatPanel::clear_chat() {
     stop_e015_requests();
     e015_manual_prompt_.clear();
+    e015_completed_manual_prompt_.clear();
+    e015_manual_stale_retried_ = false;
     e015_attempted_version_.clear();
     e015_last_plan_ = {};
     e015_version_unverified_ = false;

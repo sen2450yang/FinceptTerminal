@@ -69,12 +69,14 @@ class AgentChatPanel : public QWidget {
     void ensure_e015_selector();
     void update_e015_controls();
     void sync_e015_polling();
-    void stop_e015_requests();
-    void check_e015_version();
+    void stop_e015_requests(bool preserve_manual = false);
+    void check_e015_version(bool manual = false);
     void request_e015_plan(bool automatic);
+    void fail_e015_manual(const QString& text);
+    void reveal_e015_plan();
     void show_e015_status(const QString& text, bool invalidate = false);
     void display_e015_plan(const QJsonObject& plan);
-    QNetworkReply* start_e015_request(const QString& path, const QByteArray& body = {});
+    QNetworkReply* start_e015_request(const QString& path, const QByteArray& body = {}, bool manual = false);
 
     // ── UI ─────────────────────────────────────────────────────────────────────
     // Header
@@ -135,9 +137,11 @@ class AgentChatPanel : public QWidget {
     QString e015_generated_at_;
     QString e015_attempted_version_;
     QString e015_manual_prompt_;
+    QString e015_completed_manual_prompt_;
     QJsonObject e015_last_plan_;
     bool e015_version_unverified_ = false;
     bool e015_refresh_deferred_ = false;
+    bool e015_manual_stale_retried_ = false;
 };
 
 } // namespace fincept::screens
