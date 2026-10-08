@@ -13,22 +13,42 @@
 #include "ui/theme/ThemeManager.h"
 
 #include <QCompleter>
+#include <QApplication>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QEvent>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHideEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QNetworkProxy>
+#include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QScrollBar>
 #include <QSizePolicy>
 #include <QTextOption>
+#include <memory>
 
 namespace fincept::screens {
 
 namespace col = fincept::ui::colors;
 namespace fnt = fincept::ui::fonts;
+
+static const QString kE015Agent = QStringLiteral("e015-strategy-brain");
+static constexpr qint64 kE015ResponseLimit = 2 * 1024 * 1024;
+
+// Escape raw HTML before the existing renderer, and remove Markdown images so
+// bridge text cannot request external or local-file resources through QTextEdit.
+static QString e015_markdown(const QString& text) {
+    auto html = ui::MarkdownRenderer::render(text.toHtmlEscaped());
+    html.remove(QRegularExpression(QStringLiteral("<img\\b[^>]*>"), QRegularExpression::CaseInsensitiveOption));
+    html.replace(QStringLiteral("font-size:14px; margin:0"), QStringLiteral("font-size:16px; margin:0"));
+    return html;
+}
 
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
@@ -84,6 +104,13 @@ AgentChatPanel::AgentChatPanel(QWidget* parent) : QWidget(parent) {
 
     build_ui();
     setup_connections();
+    e015_network_ = new QNetworkAccessManager(this);
+    e015_network_->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    e015_poll_timer_ = new QTimer(this);
+    e015_poll_timer_->setInterval(60000);
+    connect(e015_poll_timer_, &QTimer::timeout, this, &AgentChatPanel::check_e015_version);
+    connect(qApp, &QGuiApplication::applicationStateChanged, this,
+            [this](Qt::ApplicationState) { sync_e015_polling(); });
 
     // Seed agent selector from cache immediately
     const auto cached = services::AgentService::instance().cached_agents();
@@ -91,8 +118,10 @@ AgentChatPanel::AgentChatPanel(QWidget* parent) : QWidget(parent) {
         agent_selector_->blockSignals(true);
         agent_selector_->clear();
         agent_selector_->addItem(tr("Default (global LLM)"), QString{});
+        ensure_e015_selector();
         for (const auto& a : cached)
-            agent_selector_->addItem(QString("[%1] %2").arg(a.category, a.name), a.id);
+            if (a.id != kE015Agent)
+                agent_selector_->addItem(QString("[%1] %2").arg(a.category, a.name), a.id);
         agent_selector_->blockSignals(false);
     }
 
@@ -139,6 +168,7 @@ void AgentChatPanel::build_ui() {
 
     agent_selector_ = new QComboBox;
     agent_selector_->addItem(tr("Default (global LLM)"), QString{});
+    ensure_e015_selector();
     agent_selector_->setMinimumWidth(200);
     agent_selector_->setMaximumWidth(420);
     agent_selector_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -447,6 +477,7 @@ void AgentChatPanel::build_ui() {
 
     // ── Status bar ────────────────────────────────────────────────────────────
     status_label_ = new QLabel;
+    status_label_->setTextFormat(Qt::PlainText);
     status_label_->setFixedHeight(18);
     status_label_->setStyleSheet(
         QString("background:%1;color:%2;font-size:9px;padding:0 14px;").arg(col::BG_SURFACE(), col::TEXT_TERTIARY()));
@@ -456,6 +487,14 @@ void AgentChatPanel::build_ui() {
 // ── Event filter (Enter to send) ─────────────────────────────────────────────
 
 bool AgentChatPanel::eventFilter(QObject* obj, QEvent* event) {
+    if (obj == e015_plan_body_ && event->type() == QEvent::Resize) {
+        QTimer::singleShot(0, this, [this]() {
+            if (e015_plan_body_) {
+                e015_plan_body_->document()->setTextWidth(qMax(200, e015_plan_body_->viewport()->width()));
+                e015_plan_body_->setFixedHeight(qMax(48, static_cast<int>(e015_plan_body_->document()->size().height()) + 12));
+            }
+        });
+    }
     if (obj == input_edit_ && event->type() == QEvent::KeyPress) {
         auto* ke = static_cast<QKeyEvent*>(event);
         if ((ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) && !(ke->modifiers() & Qt::ShiftModifier)) {
@@ -472,6 +511,10 @@ bool AgentChatPanel::eventFilter(QObject* obj, QEvent* event) {
 void AgentChatPanel::setup_connections() {
     connect(send_btn_, &QPushButton::clicked, this, &AgentChatPanel::send_message);
     connect(clear_btn_, &QPushButton::clicked, this, &AgentChatPanel::clear_chat);
+    connect(agent_selector_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        update_e015_controls();
+        sync_e015_polling();
+    });
 
     connect(route_toggle_, &QPushButton::toggled, this, [this](bool on) {
         auto_routing_ = on;
@@ -510,8 +553,10 @@ void AgentChatPanel::setup_connections() {
                 agent_selector_->blockSignals(true);
                 agent_selector_->clear();
                 agent_selector_->addItem(tr("Default (global LLM)"), QString{});
+                ensure_e015_selector();
                 for (const auto& a : agents)
-                    agent_selector_->addItem(QString("[%1] %2").arg(a.category, a.name), a.id);
+                    if (a.id != kE015Agent)
+                        agent_selector_->addItem(QString("[%1] %2").arg(a.category, a.name), a.id);
                 // Restore previous selection
                 int restore = 0;
                 if (!prev_id.isEmpty()) {
@@ -524,6 +569,8 @@ void AgentChatPanel::setup_connections() {
                 }
                 agent_selector_->blockSignals(false);
                 agent_selector_->setCurrentIndex(restore);
+                update_e015_controls();
+                sync_e015_polling();
                 // Keep completer model in sync after repopulation
                 if (agent_selector_->completer())
                     agent_selector_->completer()->setModel(agent_selector_->model());
@@ -607,7 +654,7 @@ void AgentChatPanel::setup_connections() {
     // disabled and `executing_` stuck true — the panel was dead until restart.
     // Mirrors the guard TeamsViewPanel / WorkflowsViewPanel already have.
     connect(&svc, &services::AgentService::error_occurred, this, [this](const QString&, const QString& msg) {
-        if (!executing_)
+        if (!executing_ || e015_selected())
             return;
         show_typing(false);
         set_executing(false);
@@ -668,9 +715,18 @@ void AgentChatPanel::setup_connections() {
 
 void AgentChatPanel::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
-    services::AgentService::instance().discover_agents();
+    if (!e015_selected()) {
+        services::AgentService::instance().discover_agents();
+        refresh_portfolios();
+    }
     update_llm_status();
-    refresh_portfolios();
+    update_e015_controls();
+    sync_e015_polling();
+}
+
+void AgentChatPanel::hideEvent(QHideEvent* event) {
+    QWidget::hideEvent(event);
+    stop_e015_requests();
 }
 
 // ── LLM status display ────────────────────────────────────────────────────────
@@ -694,6 +750,352 @@ void AgentChatPanel::update_llm_status() {
         hdr_status_lbl_->setStyleSheet(QString("color:%1;font-size:9px;font-weight:700;").arg(col::NEGATIVE()));
         status_label_->setText(tr("No LLM provider configured — go to Settings > LLM Configuration"));
     }
+    if (e015_selected()) {
+        if (!e015_configured()) {
+            stop_e015_requests();
+            show_e015_status(tr("需配置 gpt-6-astra、本地地址 http://127.0.0.1:18769/v1 和认证令牌。"), true);
+        } else {
+            sync_e015_polling();
+        }
+    }
+}
+
+// ── E015 authenticated local bridge ──────────────────────────────────────────
+
+bool AgentChatPanel::e015_selected() const {
+    return agent_selector_->currentData().toString() == kE015Agent;
+}
+
+bool AgentChatPanel::e015_active() const {
+    return e015_selected() && isVisible() && qApp->applicationState() == Qt::ApplicationActive;
+}
+
+bool AgentChatPanel::e015_configured() const {
+    const auto& llm = ai_chat::LlmService::instance();
+    const QString token = llm.active_api_key();
+    return llm.active_model() == QStringLiteral("gpt-6-astra") &&
+           llm.active_base_url() == QStringLiteral("http://127.0.0.1:18769/v1") &&
+           !token.trimmed().isEmpty() && !token.contains('\r') && !token.contains('\n');
+}
+
+void AgentChatPanel::ensure_e015_selector() {
+    if (agent_selector_->findData(kE015Agent) < 0)
+        agent_selector_->addItem(tr("E015 策略AI（实时计划）"), kE015Agent);
+}
+
+void AgentChatPanel::update_e015_controls() {
+    const bool selected = e015_selected();
+    if (selected) {
+        route_toggle_->setChecked(false);
+        run_as_task_toggle_->setChecked(false);
+        // Ignore any legacy agent completion after changing to this local brain.
+        if (!pending_request_id_.isEmpty()) {
+            show_typing(false);
+            set_executing(false);
+            streaming_bubble_widget_ = nullptr;
+            streaming_text_.clear();
+        }
+    }
+    route_toggle_->setEnabled(!selected);
+    run_as_task_toggle_->setEnabled(!selected);
+    portfolio_combo_->setEnabled(!selected);
+    analyze_btn_->setEnabled(!selected);
+    rebalance_btn_->setEnabled(!selected);
+    risk_btn_->setEnabled(!selected);
+    portfolio_caption_->setText(selected ? tr("原始 E015 账本与策略") : tr("PORTFOLIO:"));
+    portfolio_caption_->setToolTip(selected ? tr("读取原始 E015 持仓、资金与策略；不使用 Fincept 的重复组合。") : QString{});
+    status_label_->setFixedHeight(selected ? 42 : 18);
+    status_label_->setWordWrap(selected);
+    status_label_->setStyleSheet(QString("background:%1;color:%2;font-size:%3px;padding:0 14px;")
+                                     .arg(col::BG_SURFACE(), col::TEXT_TERTIARY()).arg(selected ? 14 : 9));
+    if (e015_plan_panel_)
+        e015_plan_panel_->setVisible(selected);
+}
+
+void AgentChatPanel::sync_e015_polling() {
+    if (!e015_poll_timer_)
+        return;
+    if (!e015_active()) {
+        stop_e015_requests();
+        return;
+    }
+    if (!e015_configured()) {
+        stop_e015_requests();
+        show_e015_status(tr("需配置 gpt-6-astra、本地地址 http://127.0.0.1:18769/v1 和认证令牌。"), true);
+        return;
+    }
+    e015_poll_timer_->start();
+    check_e015_version();
+}
+
+void AgentChatPanel::stop_e015_requests() {
+    e015_version_unverified_ = true;
+    if (e015_poll_timer_)
+        e015_poll_timer_->stop();
+    if (e015_plan_reply_)
+        e015_attempted_version_.clear(); // An interrupted request was never a completed attempt.
+    for (auto* slot : {&e015_version_reply_, &e015_plan_reply_}) {
+        if (*slot) {
+            auto* reply = slot->data();
+            *slot = nullptr;
+            reply->abort();
+        }
+    }
+    if (!e015_manual_prompt_.isEmpty())
+        set_executing(false); // The queued prompt resumes on activation; the draft stays intact.
+}
+
+QNetworkReply* AgentChatPanel::start_e015_request(const QString& path, const QByteArray& body) {
+    if (!e015_active() || !e015_configured())
+        return nullptr;
+    QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:18769") + path));
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setRawHeader("Authorization", "Bearer " + ai_chat::LlmService::instance().active_api_key().toUtf8());
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    request.setTransferTimeout(125000);
+    auto* reply = body.isEmpty() ? e015_network_->get(request) : e015_network_->post(request, body);
+    reply->setReadBufferSize(kE015ResponseLimit + 1);
+    auto* timeout = new QTimer(reply);
+    timeout->setSingleShot(true);
+    connect(timeout, &QTimer::timeout, reply, [reply]() {
+        reply->setProperty("e015_timeout", true);
+        reply->abort();
+    });
+    timeout->start(125000); // Absolute deadline also bounds continuously streaming replies.
+    connect(reply, &QNetworkReply::metaDataChanged, reply, [reply]() {
+        if (reply->header(QNetworkRequest::ContentLengthHeader).toLongLong() > kE015ResponseLimit) {
+            reply->setProperty("e015_oversize", true);
+            reply->abort();
+        }
+    });
+    const auto bytes = std::make_shared<QByteArray>();
+    const auto collect = [reply, bytes]() {
+        const auto chunk = reply->read(kE015ResponseLimit - bytes->size() + 1);
+        if (bytes->size() + chunk.size() > kE015ResponseLimit) {
+            reply->setProperty("e015_oversize", true);
+            reply->abort();
+        } else {
+            bytes->append(chunk);
+            reply->setProperty("e015_body", *bytes);
+        }
+    };
+    connect(reply, &QNetworkReply::readyRead, reply, collect);
+    connect(reply, &QNetworkReply::finished, reply, collect);
+    return reply;
+}
+
+// Errors are displayed as plain text, capped, and scrubbed of the active token.
+static QString e015_reply_error(QNetworkReply* reply, const QJsonObject& object) {
+    QString message;
+    const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (reply->property("e015_oversize").toBool())
+        message = QStringLiteral("响应超过 2MB 限制");
+    else if (reply->property("e015_timeout").toBool())
+        message = QStringLiteral("请求超时");
+    else if (http >= 300 && http < 400)
+        message = QStringLiteral("本地桥接重定向已拒绝");
+    else if (reply->error() != QNetworkReply::NoError || http != 200)
+        message = QStringLiteral("HTTP %1：%2").arg(http).arg(object.value("error").toObject().value("message").toString(
+            QStringLiteral("本地桥接请求失败")));
+    const QString token = ai_chat::LlmService::instance().active_api_key();
+    if (!token.isEmpty())
+        message.replace(token, QStringLiteral("[已隐藏]"));
+    return message.left(400);
+}
+
+void AgentChatPanel::check_e015_version() {
+    if (!e015_active() || e015_version_reply_)
+        return;
+    if (!e015_configured()) {
+        stop_e015_requests();
+        show_e015_status(tr("E015 本地桥接配置或认证令牌无效。"), true);
+        return;
+    }
+    auto* reply = start_e015_request(QStringLiteral("/e015/version"));
+    if (!reply)
+        return;
+    e015_version_reply_ = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (e015_version_reply_ != reply)
+            return;
+        e015_version_reply_ = nullptr;
+        if (!e015_active())
+            return;
+        QJsonParseError parse_error;
+        const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
+        const auto object = doc.object();
+        const QString error = e015_reply_error(reply, object);
+        if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject() ||
+            object.value("version").toString().isEmpty() || !object.value("no_orders_sent").toBool() ||
+            !object.value("no_account_writes").toBool()) {
+            e015_version_unverified_ = true;
+            show_e015_status(error.isEmpty() ? tr("E015 版本响应无效，当前计划待核验。") : error, true);
+            if (!e015_plan_reply_)
+                set_executing(false);
+            return;
+        }
+        const QString version = object.value("version").toString();
+        const bool changed = version != e015_version_;
+        const bool restore_verified = e015_version_unverified_ &&
+                                      e015_last_plan_.value("version").toString() == version;
+        e015_version_unverified_ = false;
+        e015_version_ = version;
+        e015_generated_at_ = object.value("generated_at").toString();
+        if (changed) {
+            show_e015_status(tr("数据变化，正在更新"), true);
+            e015_refresh_deferred_ = true;
+        }
+        if (!e015_plan_reply_) {
+            if (!e015_manual_prompt_.isEmpty())
+                request_e015_plan(false);
+            else if (e015_attempted_version_ != e015_version_)
+                request_e015_plan(true);
+            else if (restore_verified)
+                display_e015_plan(e015_last_plan_);
+        }
+    });
+}
+
+void AgentChatPanel::request_e015_plan(bool automatic) {
+    if (!e015_active() || !e015_configured() || e015_plan_reply_ || e015_version_.isEmpty())
+        return;
+    const QString version = e015_version_;
+    const QString prompt = automatic ? tr("根据最新已登记持仓和资金，给出当前可执行与后续分步计划；保持原批次和追加计划顺序。")
+                                     : e015_manual_prompt_;
+    const QJsonObject body{{"prompt", prompt}, {"expected_version", version}, {"automatic", automatic}};
+    auto* reply = start_e015_request(QStringLiteral("/e015/plan"), QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!reply)
+        return;
+    e015_plan_reply_ = reply;
+    e015_attempted_version_ = version;
+    e015_refresh_deferred_ = false;
+    if (!automatic)
+        set_executing(true);
+    show_e015_status(automatic ? tr("数据变化，正在更新") : tr("正在生成 E015 计划"));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, automatic, version]() {
+        reply->deleteLater();
+        if (e015_plan_reply_ != reply)
+            return;
+        e015_plan_reply_ = nullptr;
+        if (!automatic) {
+            e015_manual_prompt_.clear();
+            set_executing(false);
+        }
+        if (!e015_active())
+            return;
+        QJsonParseError parse_error;
+        const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
+        const auto object = doc.object();
+        const QString error = e015_reply_error(reply, object);
+        const QString status = object.value("status").toString();
+        const bool stale = status == QStringLiteral("stale") || version != e015_version_ ||
+                           object.value("version").toString() != e015_version_ ||
+                           (!object.value("latest_version").toString().isEmpty() &&
+                            object.value("latest_version").toString() != e015_version_);
+        if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
+            show_e015_status(error.isEmpty() ? tr("E015 计划响应无效。") : error, true);
+        } else if (stale) {
+            show_e015_status(tr("计划版本已过期；数据变化，正在更新"), true);
+            check_e015_version(); // Recheck once; unchanged failed inputs never trigger a retry loop.
+        } else if (status == QStringLiteral("current") || status == QStringLiteral("ai_unavailable")) {
+            display_e015_plan(object);
+        } else {
+            show_e015_status(tr("E015 计划状态无效。"), true);
+        }
+        if (e015_refresh_deferred_ && !e015_version_reply_ && e015_attempted_version_ != e015_version_)
+            request_e015_plan(true);
+    });
+}
+
+void AgentChatPanel::show_e015_status(const QString& text, bool invalidate) {
+    if (!e015_plan_panel_) {
+        auto* panel = new QFrame(messages_container_);
+        panel->setStyleSheet(bubble_style("assistant"));
+        auto* layout = new QVBoxLayout(panel);
+        auto* label = new QLabel;
+        label->setTextFormat(Qt::PlainText);
+        label->setWordWrap(true);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        label->setStyleSheet(QString("color:%1;font-size:14px;background:transparent;").arg(col::TEXT_SECONDARY()));
+        auto* body = new QTextEdit;
+        body->installEventFilter(this);
+        body->setReadOnly(true);
+        body->setFrameShape(QFrame::NoFrame);
+        body->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        body->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        body->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        body->setStyleSheet(QString("background:transparent;color:%1;font-size:16px;border:none;").arg(col::TEXT_PRIMARY()));
+        auto resize_body = [body]() {
+            body->document()->setTextWidth(qMax(200, body->viewport()->width()));
+            body->setFixedHeight(qMax(48, static_cast<int>(body->document()->size().height()) + 12));
+        };
+        connect(body->document(), &QTextDocument::contentsChanged, body, resize_body);
+        layout->addWidget(label);
+        auto* shortcuts = new QHBoxLayout;
+        shortcuts->setSpacing(8);
+        const auto add_shortcut = [this, shortcuts](const QString& title, const QString& prompt) {
+            auto* button = new QPushButton(title);
+            button->setMinimumHeight(32);
+            button->setCursor(Qt::PointingHandCursor);
+            button->setToolTip(tr("本地只读查询，使用原始 E015 账本与策略。"));
+            button->setStyleSheet(QString("QPushButton{background:%1;color:%2;border:1px solid %3;"
+                                         "font-size:14px;padding:4px 12px;border-radius:3px;}"
+                                         "QPushButton:hover{border-color:%2;}")
+                                      .arg(col::BG_BASE(), col::CYAN(), col::BORDER_MED()));
+            connect(button, &QPushButton::clicked, this, [this, prompt]() {
+                if (!e015_active() || !e015_configured() || executing_)
+                    return;
+                const QString draft = input_edit_->toPlainText();
+                input_edit_->setPlainText(prompt);
+                send_message();
+                input_edit_->setPlainText(draft);
+            });
+            shortcuts->addWidget(button);
+        };
+        add_shortcut(tr("持仓"), QStringLiteral("查看全部持仓"));
+        add_shortcut(tr("规则"), QStringLiteral("查看策略规则"));
+        add_shortcut(tr("批次投后"), QStringLiteral("查看批次投后金额"));
+        add_shortcut(tr("交易记录"), QStringLiteral("查看交易记录"));
+        shortcuts->addStretch();
+        layout->addLayout(shortcuts);
+        layout->addWidget(body);
+        messages_layout_->insertWidget(messages_layout_->count() - 1, panel);
+        e015_plan_panel_ = panel;
+        e015_plan_status_ = label;
+        e015_plan_body_ = body;
+    }
+    show_welcome(false);
+    e015_plan_panel_->setVisible(e015_selected());
+    if (invalidate)
+        e015_plan_body_->setPlainText(tr("当前计划待更新，请勿执行旧版本。"));
+    e015_plan_status_->setText(tr("E015 策略AI · %1\n源版本：%2 · 数据时间：%3\n原始 E015 账本与策略；仅生成计划，不下单；真实成交须登记")
+                                  .arg(text, e015_version_.isEmpty() ? tr("待获取") : e015_version_, e015_generated_at_));
+    status_label_->setText(text);
+    hdr_status_lbl_->setText(tr("E015"));
+}
+
+void AgentChatPanel::display_e015_plan(const QJsonObject& plan) {
+    QString status = plan.value("status").toString() == QStringLiteral("ai_unavailable")
+                         ? tr("确定性计划已更新；AI 暂不可用") : tr("当前计划已更新");
+    QStringList warnings;
+    for (const auto& warning : plan.value("warnings").toArray())
+        if (warning.isString())
+            warnings.append(warning.toString());
+    if (!warnings.isEmpty())
+        status += QStringLiteral("\n") + warnings.join(QStringLiteral("\n"));
+    e015_generated_at_ = plan.value("generated_at").toString();
+    show_e015_status(status);
+    const QString engine = plan.value("engine_text").toString();
+    if (engine.trimmed().isEmpty()) {
+        show_e015_status(tr("缺少确定性引擎计划，当前计划不可用。"), true);
+        return;
+    }
+    e015_last_plan_ = plan;
+    const QString assistant = plan.value("assistant_text").toString();
+    e015_plan_body_->setHtml(e015_markdown(tr("## E015 确定性执行计划\n\n") + engine +
+                                         (assistant.isEmpty() ? QString{} : tr("\n\n## AI 解释\n\n") + assistant)));
+    scroll_to_bottom();
 }
 
 // ── send_message ─────────────────────────────────────────────────────────────
@@ -702,6 +1104,28 @@ void AgentChatPanel::send_message() {
     const QString text = input_edit_->toPlainText().trimmed();
     if (text.isEmpty() || executing_)
         return;
+
+    if (e015_selected()) {
+        if (!e015_active() || !e015_configured()) {
+            show_e015_status(tr("E015 仅在窗口激活时使用已认证的本地桥接；请检查模型、地址和令牌。"), true);
+            return;
+        }
+        // An explicit follow-up supersedes an automatic refresh, preserving the draft.
+        if (e015_plan_reply_) {
+            auto* reply = e015_plan_reply_.data();
+            e015_plan_reply_ = nullptr;
+            reply->abort();
+        }
+        e015_manual_prompt_ = text;
+        add_user_bubble(text);
+        input_edit_->clear();
+        set_executing(true);
+        if (e015_version_.isEmpty())
+            check_e015_version();
+        else
+            request_e015_plan(false);
+        return;
+    }
 
     // Guard: require LLM config
     auto& llm = ai_chat::LlmService::instance();
@@ -770,6 +1194,14 @@ void AgentChatPanel::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
     if (!messages_container_)
         return;
+    if (e015_plan_body_) {
+        QTimer::singleShot(0, this, [this]() {
+            if (!e015_plan_body_)
+                return;
+            e015_plan_body_->document()->setTextWidth(qMax(200, e015_plan_body_->viewport()->width()));
+            e015_plan_body_->setFixedHeight(qMax(48, static_cast<int>(e015_plan_body_->document()->size().height()) + 12));
+        });
+    }
     const int max_user = static_cast<int>(width() * 0.72);
     const int max_ai = static_cast<int>(width() * 0.82);
     // Update all col_w widgets — they are direct children of row widgets in the layout
@@ -1081,6 +1513,14 @@ void AgentChatPanel::show_typing(bool on) {
 }
 
 void AgentChatPanel::clear_chat() {
+    stop_e015_requests();
+    e015_manual_prompt_.clear();
+    e015_attempted_version_.clear();
+    e015_last_plan_ = {};
+    e015_version_unverified_ = false;
+    e015_plan_panel_ = nullptr;
+    e015_plan_status_ = nullptr;
+    e015_plan_body_ = nullptr;
     // Null streaming refs before deleting widgets
     streaming_bubble_widget_ = nullptr;
     streaming_text_.clear();
@@ -1132,6 +1572,9 @@ void AgentChatPanel::retranslateUi() {
         // Item 0 is the fixed "Default (global LLM)" entry (empty data role).
         if (agent_selector_->count() > 0 && agent_selector_->itemData(0).toString().isEmpty())
             agent_selector_->setItemText(0, tr("Default (global LLM)"));
+        const int e015_index = agent_selector_->findData(kE015Agent);
+        if (e015_index >= 0)
+            agent_selector_->setItemText(e015_index, tr("E015 策略AI（实时计划）"));
     }
     // Toggle buttons reflect on/off state — re-apply the matching label.
     if (route_toggle_)
@@ -1177,6 +1620,7 @@ void AgentChatPanel::retranslateUi() {
     // Header status pill + live status bar hold runtime state. Refresh the LLM
     // status (it re-derives Ready / model / Unconfigured text from current config).
     update_llm_status();
+    update_e015_controls();
 }
 
 } // namespace fincept::screens

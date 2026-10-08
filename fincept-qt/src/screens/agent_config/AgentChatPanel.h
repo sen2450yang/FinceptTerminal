@@ -6,6 +6,9 @@
 #include <QEvent>
 #include <QFrame>
 #include <QLabel>
+#include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
 #include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
@@ -26,6 +29,7 @@ class AgentChatPanel : public QWidget {
 
   protected:
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void changeEvent(QEvent* event) override;
     bool eventFilter(QObject* obj, QEvent* event) override;
@@ -57,6 +61,20 @@ class AgentChatPanel : public QWidget {
     void update_llm_status();
 
     void send_message();
+
+    // Dedicated read-only E015 bridge. It never enters AgentService's execution path.
+    bool e015_selected() const;
+    bool e015_active() const;
+    bool e015_configured() const;
+    void ensure_e015_selector();
+    void update_e015_controls();
+    void sync_e015_polling();
+    void stop_e015_requests();
+    void check_e015_version();
+    void request_e015_plan(bool automatic);
+    void show_e015_status(const QString& text, bool invalidate = false);
+    void display_e015_plan(const QJsonObject& plan);
+    QNetworkReply* start_e015_request(const QString& path, const QByteArray& body = {});
 
     // ── UI ─────────────────────────────────────────────────────────────────────
     // Header
@@ -106,6 +124,20 @@ class AgentChatPanel : public QWidget {
     QPointer<QTextEdit> streaming_bubble_widget_;
 
     QTimer* typing_timer_ = nullptr;
+    QTimer* e015_poll_timer_ = nullptr;
+    QNetworkAccessManager* e015_network_ = nullptr;
+    QPointer<QNetworkReply> e015_version_reply_;
+    QPointer<QNetworkReply> e015_plan_reply_;
+    QPointer<QWidget> e015_plan_panel_;
+    QPointer<QLabel> e015_plan_status_;
+    QPointer<QTextEdit> e015_plan_body_;
+    QString e015_version_;
+    QString e015_generated_at_;
+    QString e015_attempted_version_;
+    QString e015_manual_prompt_;
+    QJsonObject e015_last_plan_;
+    bool e015_version_unverified_ = false;
+    bool e015_refresh_deferred_ = false;
 };
 
 } // namespace fincept::screens
