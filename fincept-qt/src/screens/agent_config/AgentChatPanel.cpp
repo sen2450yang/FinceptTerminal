@@ -861,6 +861,7 @@ void AgentChatPanel::sync_e015_polling() {
 
 void AgentChatPanel::stop_e015_requests(bool preserve_manual) {
     e015_version_unverified_ = true;
+    e015_task_recovery_requested_ = false;
     if (e015_poll_timer_)
         e015_poll_timer_->stop();
     if (e015_task_timer_)
@@ -1017,6 +1018,7 @@ void AgentChatPanel::check_e015_version(bool manual) {
 
 void AgentChatPanel::request_e015_plan(bool automatic) {
     if (!e015_selected() || !e015_configured() || e015_plan_reply_ || !e015_task_id_.isEmpty() ||
+        (!e015_task_request_id_.isEmpty() && (e015_task_cancel_requested_ || e015_task_discard_)) ||
         e015_version_.isEmpty() || (automatic ? !e015_active() : e015_manual_prompt_.isEmpty()))
         return;
     if (e015_task_request_id_.isEmpty()) {
@@ -1028,14 +1030,16 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
         e015_task_cancel_requested_ = false;
         e015_task_discard_ = false;
         e015_task_uncertain_ = false;
+        e015_task_recovery_requested_ = false;
         e015_task_control_attempts_ = 0;
+        const QString prompt = automatic ? tr("根据最新已登记持仓和资金，给出当前可执行与后续分步计划；保持原批次和追加计划顺序。")
+                                         : e015_manual_prompt_;
+        const QJsonObject body{{"prompt", prompt}, {"expected_version", e015_task_version_},
+                              {"automatic", automatic}, {"request_id", e015_task_request_id_}};
+        e015_task_create_body_ = QJsonDocument(body).toJson(QJsonDocument::Compact);
     }
     const QString request_id = e015_task_request_id_;
-    const QString prompt = automatic ? tr("根据最新已登记持仓和资金，给出当前可执行与后续分步计划；保持原批次和追加计划顺序。")
-                                     : e015_manual_prompt_;
-    const QJsonObject body{{"prompt", prompt}, {"expected_version", e015_task_version_},
-                          {"automatic", automatic}, {"request_id", request_id}};
-    auto* reply = start_e015_request(QStringLiteral("/e015/tasks"), QJsonDocument(body).toJson(QJsonDocument::Compact),
+    auto* reply = start_e015_request(QStringLiteral("/e015/tasks"), e015_task_create_body_,
                                      !automatic);
     if (!reply)
         return;
@@ -1086,7 +1090,7 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
             // fresh task. Authentication and invalid responses fail immediately.
             const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             const bool uncertain = http == 0 || http >= 500 || (http >= 200 && http < 300);
-            if (uncertain && !e015_task_discard_ && e015_task_create_attempts_ < 3 &&
+            if (uncertain && !e015_task_cancel_requested_ && !e015_task_discard_ && e015_task_create_attempts_ < 3 &&
                 (!automatic || e015_active())) {
                 show_e015_status(tr("提交连接中断；正在核对同一任务"));
                 QTimer::singleShot(1000, this, [this, automatic, request_id]() {
@@ -1096,8 +1100,8 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
                 return;
             }
             if (uncertain || e015_task_discard_ || (automatic && !e015_active())) {
-                // Keep the UUID after uncertain creation. Only GET or cancel
-                // may reconcile it; a fresh send must not duplicate server work.
+                // Keep the UUID after uncertain creation. GET/cancel reconcile
+                // it; explicit Continue can recover confirmed missing work.
                 e015_task_id_ = request_id;
                 e015_task_uncertain_ = true;
                 e015_task_status_ = QStringLiteral("queued");
@@ -1123,6 +1127,8 @@ void AgentChatPanel::request_e015_plan(bool automatic) {
         }
         e015_task_id_ = id;
         e015_task_uncertain_ = false;
+        if (release_e015_unsubmitted_cancel(object))
+            return;
         e015_task_status_ = status;
         e015_task_started_ = QDateTime::currentMSecsSinceEpoch();
         e015_task_poll_failures_ = 0;
@@ -1176,10 +1182,30 @@ void AgentChatPanel::poll_e015_task() {
         const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
         const auto object = doc.object();
         const QString error = e015_reply_error(reply, object);
+        const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const bool missing = http == 404 && !reply->property("e015_timeout").toBool() &&
+                             !reply->property("e015_oversize").toBool() &&
+                             parse_error.error == QJsonParseError::NoError && doc.isObject() &&
+                             object.value("error").toObject().value("code").toString() == QStringLiteral("not_found");
+        // Only explicit Continue may authorize another create attempt, and only
+        // after GET confirms absence. Reuse the original UUID and exact bytes.
+        if (missing && e015_task_uncertain_ && e015_task_recovery_requested_ && e015_active() &&
+            !e015_task_automatic_ && !e015_task_cancel_requested_ && !e015_task_discard_ &&
+            id == e015_task_request_id_ && !e015_task_create_body_.isEmpty()) {
+            e015_task_recovery_requested_ = false;
+            e015_task_timer_->stop();
+            e015_task_id_.clear();
+            e015_task_uncertain_ = false;
+            e015_task_create_attempts_ = 0;
+            set_executing(true);
+            request_e015_plan(false);
+            return;
+        }
         if (!error.isEmpty() || parse_error.error != QJsonParseError::NoError || !doc.isObject() ||
             object.value("id").toString() != id) {
             if (++e015_task_poll_failures_ >= 3) {
                 e015_task_timer_->stop();
+                e015_task_recovery_requested_ = false;
                 e015_task_status_ = QStringLiteral("paused");
                 set_executing(false);
                 if (!e015_task_discard_) {
@@ -1195,7 +1221,10 @@ void AgentChatPanel::poll_e015_task() {
             return;
         }
         e015_task_poll_failures_ = 0;
+        e015_task_recovery_requested_ = false;
         e015_task_uncertain_ = false;
+        if (release_e015_unsubmitted_cancel(object))
+            return;
         if (e015_task_cancel_requested_) {
             control_e015_task(false);
             return;
@@ -1223,9 +1252,17 @@ void AgentChatPanel::control_e015_task(bool resume) {
     // request_id is also the task id, so an uncertain POST can be cancelled
     // without retrying creation while the window is hidden.
     const QString id = e015_task_id_.isEmpty() ? e015_task_request_id_ : e015_task_id_;
-    if (id.isEmpty() || e015_control_reply_ || !e015_configured() || (resume && !e015_active()))
+    if (id.isEmpty())
+        return;
+    if (!resume) {
+        e015_task_cancel_requested_ = true;
+        e015_task_recovery_requested_ = false;
+    }
+    if (e015_control_reply_ || !e015_configured() || (resume && !e015_active()))
         return;
     if (resume && e015_task_uncertain_) {
+        e015_task_recovery_requested_ = !e015_task_automatic_ && !e015_task_cancel_requested_ &&
+                                        !e015_task_discard_ && !e015_task_create_body_.isEmpty();
         e015_task_poll_failures_ = 0;
         e015_task_status_ = QStringLiteral("queued");
         e015_task_timer_->start();
@@ -1255,6 +1292,20 @@ void AgentChatPanel::control_e015_task(bool resume) {
         const auto doc = QJsonDocument::fromJson(reply->property("e015_body").toByteArray(), &parse_error);
         const auto object = doc.object();
         const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (resume && http == 409 && parse_error.error == QJsonParseError::NoError && doc.isObject() &&
+            object.value("error").toObject().value("code").toString() ==
+                QStringLiteral("task_cancelled_before_submission")) {
+            // This UUID is fenced on the bridge. GET its cancellation record;
+            // it must never enter the missing-task creation recovery path.
+            e015_task_cancel_requested_ = true;
+            e015_task_recovery_requested_ = false;
+            e015_task_id_ = id;
+            e015_task_uncertain_ = true;
+            e015_task_poll_failures_ = 0;
+            e015_task_timer_->start();
+            poll_e015_task();
+            return;
+        }
         if (!resume && (http == 404 || object.value("status").toString() == QStringLiteral("not_found"))) {
             // Cancellation can beat the original POST to the bridge. Retain its
             // UUID and let that POST finish; otherwise reconcile through GET.
@@ -1292,6 +1343,8 @@ void AgentChatPanel::control_e015_task(bool resume) {
                 });
             return;
         }
+        if (release_e015_unsubmitted_cancel(object))
+            return;
         e015_task_uncertain_ = false;
         if (object.value("status").toString() == QStringLiteral("completed")) {
             e015_task_timer_->stop();
@@ -1339,6 +1392,41 @@ void AgentChatPanel::control_e015_task(bool resume) {
             }
         }
     });
+}
+
+bool AgentChatPanel::release_e015_unsubmitted_cancel(const QJsonObject& task) {
+    if (task.value("status").toString() != QStringLiteral("cancelled") ||
+        !task.value("cancellation_before_submit").toBool())
+        return false;
+    const bool discarded = e015_task_discard_;
+    const bool manual = !e015_task_automatic_;
+    e015_task_timer_->stop();
+    ++e015_task_epoch_;
+    e015_task_id_.clear();
+    e015_task_request_id_.clear();
+    e015_task_create_body_.clear();
+    e015_task_uncertain_ = false;
+    e015_task_recovery_requested_ = false;
+    e015_task_cancel_requested_ = false;
+    e015_task_status_ = QStringLiteral("cancelled");
+    set_executing(false);
+    if (!discarded) {
+        const QString message = tr("任务在提交前已取消；可重新发送问题。");
+        if (manual)
+            fail_e015_manual(message);
+        else
+            show_e015_status(message);
+    }
+    if (e015_cancel_btn_)
+        e015_cancel_btn_->setEnabled(false);
+    if (e015_resume_btn_)
+        e015_resume_btn_->setEnabled(false);
+    if (!e015_pending_prompt_.isEmpty() && e015_active() && e015_configured()) {
+        const QString prompt = e015_pending_prompt_;
+        e015_pending_prompt_.clear();
+        submit_e015_manual(prompt);
+    }
+    return true;
 }
 
 void AgentChatPanel::display_e015_task(const QJsonObject& task) {
@@ -1623,13 +1711,6 @@ void AgentChatPanel::send_message() {
             show_e015_status(tr("E015 仅在窗口激活时使用已认证的本地桥接；请检查模型、地址和令牌。"), true);
             return;
         }
-        if (e015_task_uncertain_) {
-            show_e015_status(tr("上一任务的提交结果仍待核对；请继续原任务后再发送新问题。"));
-            e015_task_poll_failures_ = 0;
-            e015_task_timer_->start();
-            poll_e015_task();
-            return;
-        }
         // A follow-up cancels automatic work, then submits the user's saved
         // prompt. Shortcut callers can restore their draft immediately.
         if ((!e015_task_id_.isEmpty() || e015_plan_reply_) && e015_task_automatic_) {
@@ -1640,6 +1721,13 @@ void AgentChatPanel::send_message() {
             e015_task_control_attempts_ = 0;
             control_e015_task(false);
             show_e015_status(tr("正在结束自动更新并准备研究问题"));
+            return;
+        }
+        if (e015_task_uncertain_) {
+            show_e015_status(tr("上一任务的提交结果仍待核对；请继续原任务后再发送新问题。"));
+            e015_task_poll_failures_ = 0;
+            e015_task_timer_->start();
+            poll_e015_task();
             return;
         }
         if (!e015_task_id_.isEmpty()) {

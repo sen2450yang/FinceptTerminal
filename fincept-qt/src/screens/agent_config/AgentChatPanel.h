@@ -74,6 +74,7 @@ class AgentChatPanel : public QWidget {
     void request_e015_plan(bool automatic);
     void poll_e015_task();
     void control_e015_task(bool resume);
+    bool release_e015_unsubmitted_cancel(const QJsonObject& task);
     void display_e015_task(const QJsonObject& task);
     void finish_e015_task(const QJsonObject& plan);
     void submit_e015_manual(const QString& text);
@@ -147,6 +148,7 @@ class AgentChatPanel : public QWidget {
     QString e015_task_status_;
     QString e015_task_version_;
     QString e015_task_request_id_;
+    QByteArray e015_task_create_body_;
     QString e015_pending_prompt_;
     int e015_task_control_attempts_ = 0;
     int e015_task_create_attempts_ = 0;
@@ -157,6 +159,7 @@ class AgentChatPanel : public QWidget {
     bool e015_task_cancel_requested_ = false;
     bool e015_task_discard_ = false;
     bool e015_task_uncertain_ = false;
+    bool e015_task_recovery_requested_ = false;
     QString e015_version_;
     QString e015_generated_at_;
     QString e015_attempted_version_;
