@@ -1,0 +1,206 @@
+name: E015 day mode - Windows portable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/e015-day-mode]
+    paths:
+      - '.github/workflows/e015-windows.yml'
+      - 'fincept-qt/**'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      QT_VERSION: '6.8.3'
+      BUILD_DIR: fincept-qt/build/day-release
+      DIST_DIR: FinceptTerminal-4.5.0-e015-day-mode-windows-x64
+
+    steps:
+      - name: Checkout modified source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python for Qt provisioning
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install pinned CMake and Ninja
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'fincept-build-tools'
+          New-Item -ItemType Directory -Path $tools -Force | Out-Null
+          $downloads = @(
+            @{
+              Name = 'cmake.zip'
+              Url = 'https://github.com/Kitware/CMake/releases/download/v3.27.7/cmake-3.27.7-windows-x86_64.zip'
+              Sha256 = '5588e50030cda3e6fa96724444d8539916ac808d78d608cda6ae6ff7c4c4c9c8'
+              Destination = $tools
+            },
+            @{
+              Name = 'ninja.zip'
+              Url = 'https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip'
+              Sha256 = '524b344a1a9a55005eaf868d991e090ab8ce07fa109f1820d40e74642e289abc'
+              Destination = (Join-Path $tools 'ninja')
+            }
+          )
+          foreach ($download in $downloads) {
+            $archive = Join-Path $tools $download.Name
+            Invoke-WebRequest -Uri $download.Url -OutFile $archive
+            if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $download.Sha256) {
+              throw "Checksum mismatch: $($download.Name)"
+            }
+            Expand-Archive -LiteralPath $archive -DestinationPath $download.Destination -Force
+          }
+          "$tools\cmake-3.27.7-windows-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$tools\ninja" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install Qt 6.8.3 and official OpenSSL development kit
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: 'qtcharts qtwebsockets qtmultimedia qtwebengine qtwebchannel qtpositioning qtserialport qtspeech'
+          tools: 'tools_opensslv3_x64,qt.tools.opensslv3.win_x64'
+          aqtversion: '==3.3.0'
+          setup-python: false
+          cache: true
+          cache-key-prefix: e015-qt683-msvc2022-openssl-v1
+
+      - name: Verify prerequisites and repair dangling SQL plugin configs
+        run: |
+          cmake --version
+          ninja --version
+          & "$env:QT_ROOT_DIR\bin\qmake.exe" -query QT_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Qt version query failed' }
+          $openssl = Join-Path $env:IQTA_TOOLS 'OpenSSLv3\Win_x64'
+          foreach ($file in @('include\openssl\opensslv.h', 'lib\libcrypto.lib', 'lib\libssl.lib', 'bin\libcrypto-3-x64.dll', 'bin\libssl-3-x64.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $openssl $file))) { throw "OpenSSL development file missing: $file" }
+          }
+          "OPENSSL_ROOT_DIR=$openssl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $sql = Join-Path $env:QT_ROOT_DIR 'lib\cmake\Qt6Sql'
+          foreach ($driver in @('QMYSQLDriverPlugin', 'QPSQLDriverPlugin', 'QODBCDriverPlugin', 'QMimerSQLDriverPlugin')) {
+            Get-ChildItem -Path "$sql\Qt6$driver*.cmake" -ErrorAction SilentlyContinue | Remove-Item
+          }
+
+      - name: Configure Release build
+        run: |
+          cmake -S fincept-qt -B $env:BUILD_DIR -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR" `
+            "-DOPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR" `
+            -DFINCEPT_QT_PIN_MODE=EXACT `
+            -DFINCEPT_MAX_COMPILE_JOBS=2 `
+            -DFINCEPT_REQUIRE_BUNDLED_YTDLP=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+
+      - name: Compile modified application
+        run: |
+          cmake --build $env:BUILD_DIR --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'C++ build failed' }
+
+      - name: Stage portable application and complete Qt deployment
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE $env:DIST_DIR
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          foreach ($pattern in @('*.exe', '*.dll', '*.conf')) {
+            Get-ChildItem -Path "$env:BUILD_DIR\$pattern" -File -ErrorAction SilentlyContinue | Copy-Item -Destination $dist -Force
+          }
+          # CMake synchronizes/prunes Python scripts; preserve that output rather than copying developer caches.
+          foreach ($directory in @('scripts', 'resources')) {
+            $source = Join-Path $env:BUILD_DIR $directory
+            if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Build resource directory missing: $directory" }
+            Copy-Item -LiteralPath $source -Destination $dist -Recurse -Force
+          }
+          # Merge all application resources without overwriting deployed Chromium resources.
+          Copy-Item -Path 'fincept-qt\resources\*' -Destination "$dist\resources" -Recurse -Force
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations --compiler-runtime --include-soft-plugins --force "$dist\FinceptTerminal.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+          Copy-Item -Path "$env:OPENSSL_ROOT_DIR\bin\*.dll" -Destination $dist -Force
+          # App-local MSVC DLLs avoid requiring a machine-wide redistributable installation.
+          $crt = Join-Path $env:VCToolsRedistDir 'x64\Microsoft.VC143.CRT'
+          if (-not (Test-Path -LiteralPath $crt)) { throw "MSVC runtime directory missing: $crt" }
+          Copy-Item -Path "$crt\*.dll" -Destination $dist -Force
+          # Explicit plugins mirror the upstream packaging fallbacks.
+          foreach ($directory in @('platforms', 'sqldrivers', 'tls', 'imageformats', 'iconengines', 'styles', 'multimedia', 'texttospeech', 'networkinformation', 'platforminputcontexts', 'printsupport', 'generic')) {
+            $source = Join-Path "$env:QT_ROOT_DIR\plugins" $directory
+            if (Test-Path -LiteralPath $source) {
+              $target = Join-Path $dist $directory
+              New-Item -ItemType Directory -Path $target -Force | Out-Null
+              Get-ChildItem -LiteralPath $source -Filter '*.dll' -File | Where-Object {
+                # Some release names end in d (e.g. qopensslbackend.dll).
+                # Only omit a debug DLL when its release counterpart exists.
+                -not ($_.BaseName.EndsWith('d') -and (Test-Path -LiteralPath (Join-Path $_.DirectoryName ($_.BaseName.Substring(0, $_.BaseName.Length - 1) + '.dll'))))
+              } | Copy-Item -Destination $target -Force
+            }
+          }
+          "[Paths]`nPrefix = .`nPlugins = .`nLibraries = .`n" | Set-Content -LiteralPath "$dist\qt.conf" -Encoding utf8
+          Copy-Item -LiteralPath LICENSE -Destination "$dist\LICENSE" -Force
+
+      - name: Validate package completeness and record provenance
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE $env:DIST_DIR
+          $required = @('FinceptTerminal.exe', 'qgeoview.dll', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Network.dll', 'Qt6Sql.dll', 'Qt6Charts.dll', 'Qt6Multimedia.dll', 'Qt6WebEngineWidgets.dll', 'QtWebEngineProcess.exe', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll', 'vcruntime140.dll', 'msvcp140.dll', 'platforms\qwindows.dll', 'sqldrivers\qsqlite.dll', 'tls\qopensslbackend.dll', 'resources\qtwebengine_resources.pak', 'resources\icudtl.dat', 'resources\requirements-numpy1.txt', 'resources\requirements-numpy2.txt', 'qt.conf', 'yt-dlp.exe')
+          foreach ($file in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $file) -PathType Leaf)) { throw "Required package file missing: $file" }
+          }
+          if (-not (Get-ChildItem -LiteralPath "$dist\scripts" -Recurse -Filter '*.py' -File | Select-Object -First 1)) { throw 'Python analytics scripts are missing' }
+          $info = [ordered]@{
+            application = 'FinceptTerminal'
+            version = '4.5.0'
+            variant = 'e015-day-mode'
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            qt = $env:QT_VERSION
+            architecture = 'windows-x64-msvc2022'
+            built_at_utc = [DateTime]::UtcNow.ToString('o')
+            gui_acceptance = 'Pending local native interface verification'
+          }
+          $info | ConvertTo-Json | Set-Content -LiteralPath "$dist\build-info.json" -Encoding utf8
+          Get-ChildItem -LiteralPath $dist -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($dist, $_.FullName).Replace('\', '/')
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
+          } | Set-Content -LiteralPath "$dist\SHA256SUMS.txt" -Encoding utf8
+          $zip = "$env:DIST_DIR.zip"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zip" | Set-Content -LiteralPath "$zip.sha256" -Encoding utf8
+          "Portable build: commit $env:GITHUB_SHA; Qt $env:QT_VERSION; ZIP SHA256 $hash. Native UI acceptance is pending." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinceptTerminal-4.5.0-e015-day-mode-windows-x64
+          path: |
+            FinceptTerminal-4.5.0-e015-day-mode-windows-x64.zip
+            FinceptTerminal-4.5.0-e015-day-mode-windows-x64.zip.sha256
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e015-windows-build-diagnostics
+          path: |
+            fincept-qt/build/day-release/CMakeCache.txt
+            fincept-qt/build/day-release/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7
