@@ -22,7 +22,7 @@ class ThemeManager : public QObject {
   public:
     static ThemeManager& instance();
 
-    /// Apply theme (always Obsidian — single theme mode).
+    /// Apply "Obsidian" or "Light"; unknown names safely fall back to Obsidian.
     /// Builds global QSS from tokens and calls qApp->setStyleSheet().
     /// Emits theme_changed(tokens) so custom painters can update.
     void apply_theme(const QString& name);
@@ -41,7 +41,9 @@ class ThemeManager : public QObject {
     /// on KDE Plasma 6 + Qt6 + Wayland where back-to-back global restyles
     /// during a QComboBox event chain can crash the process. See GitHub issue
     /// #247 for the original repro.
-    void apply_typography_and_density(const QString& family, int size_px, const QString& density);
+    /// Optional theme selection is applied in the same single global restyle.
+    void apply_typography_and_density(const QString& family, int size_px, const QString& density,
+                                     const QString& theme = {});
 
     /// Read access to the currently active token set.
     /// Custom painters call: QColor(ThemeManager::instance().tokens().accent)
@@ -50,6 +52,7 @@ class ThemeManager : public QObject {
     QString current_theme_name() const;
     QFont current_font() const;
     static QStringList available_densities(); // single source of truth for density names
+    static QStringList available_themes();
 
     /// Returns QSS that must be applied directly to the CDockManager widget
     /// to override ADS's internally loaded default.css / focus_highlighting.css.

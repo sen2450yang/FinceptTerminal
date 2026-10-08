@@ -42,6 +42,40 @@ const ThemeTokens THEME_OBSIDIAN = {
     .chart_colors = {"#d97706", "#0891b2", "#16a34a", "#dc2626", "#2563eb", "#ca8a04"},
 };
 
+const ThemeTokens THEME_LIGHT = {
+    .name = "Light",
+    .bg_base = "#ffffff",
+    .bg_surface = "#f8fafc",
+    .bg_raised = "#f1f5f9",
+    .bg_hover = "#e2e8f0",
+    .border_dim = "#64748b",
+    .border_med = "#475569",
+    .border_bright = "#334155",
+    .text_primary = "#0f172a",
+    .text_secondary = "#334155",
+    .text_tertiary = "#475569",
+    .text_dim = "#475569",
+    .accent = "#92400e",
+    .accent_dim = "#78350f",
+    .text_on_accent = "#ffffff",
+    .icon_dim = "#475569",
+    .icon_hover = "#0f172a",
+    .positive = "#166534",
+    .positive_dim = "#14532d",
+    .negative = "#b91c1c",
+    .negative_dim = "#7f1d1d",
+    .warning = "#854d0e",
+    .info = "#1e40af",
+    .cyan = "#155e75",
+    .accent_bg = "#fff7ed",
+    .positive_bg = "#f0fdf4",
+    .negative_bg = "#fef2f2",
+    .row_alt = "#f8fafc",
+    .font_family = "'Consolas','Courier New',monospace",
+    .font_size_base = 14,
+    .chart_colors = {"#92400e", "#155e75", "#166534", "#b91c1c", "#1e40af", "#854d0e"},
+};
+
 ThemeManager::ThemeManager() : QObject(nullptr), current_(THEME_OBSIDIAN) {}
 
 ThemeManager& ThemeManager::instance() {
@@ -122,8 +156,8 @@ QStringList ThemeManager::build_font_chain(const QString& preferred) {
     return chain;
 }
 
-void ThemeManager::apply_theme(const QString& /*name*/) {
-    current_ = THEME_OBSIDIAN;
+void ThemeManager::apply_theme(const QString& name) {
+    current_ = name.compare("Light", Qt::CaseInsensitive) == 0 ? THEME_LIGHT : THEME_OBSIDIAN;
     rebuild_and_apply();
 }
 
@@ -144,7 +178,10 @@ void ThemeManager::apply_density(const QString& density) {
     rebuild_and_apply();
 }
 
-void ThemeManager::apply_typography_and_density(const QString& family, int size_px, const QString& density) {
+void ThemeManager::apply_typography_and_density(const QString& family, int size_px, const QString& density,
+                                              const QString& theme) {
+    if (!theme.isEmpty())
+        current_ = theme.compare("Light", Qt::CaseInsensitive) == 0 ? THEME_LIGHT : THEME_OBSIDIAN;
     if (!family.isEmpty())
         font_families_ = build_font_chain(family);
     font_size_px_ = (size_px > 0) ? size_px : 14;
@@ -163,6 +200,10 @@ QString ThemeManager::current_theme_name() const {
 
 QStringList ThemeManager::available_densities() {
     return {"Compact", "Default", "Comfortable"};
+}
+
+QStringList ThemeManager::available_themes() {
+    return {"Obsidian", "Light"};
 }
 
 QFont ThemeManager::current_font() const {

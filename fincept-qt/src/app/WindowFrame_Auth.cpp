@@ -352,6 +352,10 @@ void WindowFrame::on_terminal_unlocked() {
     auth::PinManager::instance().reset_lockout();
 
     if (auth.session().has_paid_plan()) {
+        // Restore docks while the PIN screen still covers the workspace. Showing
+        // WebEngine widgets first exposes their accessibility providers while
+        // the saved layout is still rebuilding the widget tree.
+        layout::WorkspaceShell::load_last_or_default();
         set_shell_visible(true);
         stack_->setCurrentIndex(1);
         // Restore chat bubble based on setting
@@ -364,9 +368,6 @@ void WindowFrame::on_terminal_unlocked() {
                 chat_bubble_->raise();
             }
         }
-        // Cold-boot restore via the new system (frame layouts, panels, dock
-        // state, monitor variants).
-        layout::WorkspaceShell::load_last_or_default();
         // Silent update check — UpdateService de-dupes across call sites so
         // the login path + this post-unlock path won't fire two requests.
         QTimer::singleShot(3000, this, [this]() {

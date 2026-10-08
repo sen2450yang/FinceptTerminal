@@ -1,4 +1,4 @@
-// AppearanceSection.cpp — typography / density / interface toggles.
+// AppearanceSection.cpp — typography / theme / density / interface toggles.
 
 #include "screens/settings/AppearanceSection.h"
 
@@ -53,6 +53,8 @@ void capture_row_labels(QWidget* row, QLabel** label_out, QLabel** desc_out = nu
 
 AppearanceSection::AppearanceSection(QWidget* parent) : QWidget(parent) {
     build_ui();
+    connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this,
+            [this](const ui::ThemeTokens&) { refresh_theme(); });
 }
 
 void AppearanceSection::showEvent(QShowEvent* e) {
@@ -149,10 +151,11 @@ void AppearanceSection::build_ui() {
     appearance_debounce_->setSingleShot(true);
     appearance_debounce_->setInterval(300);
     connect(appearance_debounce_, &QTimer::timeout, this, [this]() {
-        if (!app_font_size_ || !app_font_family_ || !app_density_)
+        if (!app_font_size_ || !app_font_family_ || !app_density_ || !app_theme_)
             return;
         const QString family = app_font_family_->currentText();
         const QString density = app_density_->currentText();
+        const QString theme = app_theme_->currentText();
         const int px = QString(app_font_size_->currentText()).replace("px", "").toInt();
         // Skip families that aren't actually installed — Qt would otherwise
         // hand QFont an invalid family which on some Wayland font backends
@@ -163,10 +166,10 @@ void AppearanceSection::build_ui() {
         QPointer<AppearanceSection> guard(this);
         QMetaObject::invokeMethod(
             qApp,
-            [guard, family, px, density]() {
+            [guard, family, px, density, theme]() {
                 if (!guard)
                     return;
-                ui::ThemeManager::instance().apply_typography_and_density(family, px, density);
+                ui::ThemeManager::instance().apply_typography_and_density(family, px, density, theme);
             },
             Qt::QueuedConnection);
     });
@@ -184,6 +187,15 @@ void AppearanceSection::build_ui() {
     theme_title_->setStyleSheet(sub_title_ss());
     vl->addWidget(theme_title_);
     vl->addSpacing(4);
+
+    app_theme_ = new QComboBox;
+    app_theme_->addItems(ui::ThemeManager::available_themes());
+    app_theme_->setCurrentText(ui::ThemeManager::instance().current_theme_name());
+    app_theme_->setStyleSheet(combo_ss());
+    auto* theme_row = make_row(tr("Color Theme"), app_theme_, tr("Light uses white surfaces and dark text."));
+    capture_row_labels(theme_row, &theme_label_, &theme_desc_);
+    vl->addWidget(theme_row);
+    connect(app_theme_, &QComboBox::currentTextChanged, this, restart_debounce);
 
     app_density_ = new QComboBox;
     app_density_->addItems(ui::ThemeManager::available_densities());
@@ -238,6 +250,7 @@ void AppearanceSection::build_ui() {
     app_font_size_->setAccessibleName(tr("Font size"));
     app_font_family_->setAccessibleName(tr("Font family"));
     app_density_->setAccessibleName(tr("Content density"));
+    app_theme_->setAccessibleName(tr("Color theme"));
     chat_bubble_toggle_->setAccessibleName(tr("Show AI chat bubble"));
     ticker_bar_toggle_->setAccessibleName(tr("Show ticker bar"));
     animations_toggle_->setAccessibleName(tr("Enable animations"));
@@ -258,6 +271,7 @@ void AppearanceSection::build_ui() {
         repo.set("appearance.font_size", app_font_size_->currentText(), "appearance");
         repo.set("appearance.font_family", app_font_family_->currentText(), "appearance");
         repo.set("appearance.density", app_density_->currentText(), "appearance");
+        repo.set("appearance.theme", app_theme_->currentText(), "appearance");
         repo.set("appearance.show_chat_bubble", chat_bubble_toggle_->isChecked() ? "true" : "false", "appearance");
         repo.set("appearance.show_ticker_bar", ticker_bar_toggle_->isChecked() ? "true" : "false", "appearance");
         repo.set("appearance.animations", animations_toggle_->isChecked() ? "true" : "false", "appearance");
@@ -270,16 +284,17 @@ void AppearanceSection::build_ui() {
             appearance_debounce_->stop();
             const QString family = app_font_family_->currentText();
             const QString density = app_density_->currentText();
+            const QString theme = app_theme_->currentText();
             int px = QString(app_font_size_->currentText()).replace("px", "").toInt();
             if (px <= 0)
                 px = 14;
             QPointer<AppearanceSection> guard(this);
             QMetaObject::invokeMethod(
                 qApp,
-                [guard, family, px, density]() {
+                [guard, family, px, density, theme]() {
                     if (!guard)
                         return;
-                    ui::ThemeManager::instance().apply_typography_and_density(family, px, density);
+                    ui::ThemeManager::instance().apply_typography_and_density(family, px, density, theme);
                 },
                 Qt::QueuedConnection);
         }
@@ -293,6 +308,37 @@ void AppearanceSection::build_ui() {
     root->addWidget(scroll);
 }
 
+void AppearanceSection::refresh_theme() {
+    using namespace settings_styles;
+    for (auto* combo : {app_font_size_, app_font_family_, app_density_, app_theme_})
+        if (combo)
+            combo->setStyleSheet(combo_ss());
+    if (typography_title_)
+        typography_title_->setStyleSheet(section_title_ss());
+    for (auto* title : {theme_title_, interface_title_})
+        if (title)
+            title->setStyleSheet(sub_title_ss());
+    for (auto* label : {font_size_label_, font_family_label_, theme_label_, theme_desc_, density_label_,
+                        density_desc_, chat_bubble_label_, chat_bubble_desc_, ticker_bar_label_,
+                        ticker_bar_desc_, animations_label_, animations_desc_})
+        if (label)
+            label->setStyleSheet(label_ss());
+    for (auto* toggle : {chat_bubble_toggle_, ticker_bar_toggle_, animations_toggle_})
+        if (toggle)
+            toggle->setStyleSheet(check_ss());
+    if (save_btn_)
+        save_btn_->setStyleSheet(btn_primary_ss());
+    for (auto* separator : findChildren<QFrame*>())
+        if (separator->height() == 1)
+            separator->setStyleSheet(QString("background:%1;").arg(ui::colors::BORDER_DIM()));
+    if (auto* scroll = findChild<QScrollArea*>())
+        scroll->setStyleSheet(QString("QScrollArea { border: none; background: transparent; }"
+                                      "QScrollBar:vertical { background: %1; width: 6px; }"
+                                      "QScrollBar::handle:vertical { background: %2; }"
+                                      "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }")
+                                  .arg(ui::colors::BG_SURFACE(), ui::colors::BORDER_MED()));
+}
+
 void AppearanceSection::reload() {
     if (!app_font_size_)
         return;
@@ -304,6 +350,7 @@ void AppearanceSection::reload() {
     const QSignalBlocker b1(app_font_size_);
     const QSignalBlocker b2(app_font_family_);
     const QSignalBlocker b4(app_density_);
+    const QSignalBlocker b5(app_theme_);
 
     // A read error is not "unset". The Save handler writes every widget on this
     // page straight back, so a failed read must disarm Save; the default is
@@ -341,6 +388,12 @@ void AppearanceSection::reload() {
     load_combo(app_font_size_, "appearance.font_size", kDefaultFontSize);
     load_combo(app_font_family_, "appearance.font_family", kDefaultFontFamily);
     load_combo(app_density_, "appearance.density", kDefaultDensity);
+    auto theme = repo.get("appearance.theme");
+    if (theme.is_err())
+        log_read_error("appearance.theme", theme.error());
+    app_theme_->setCurrentText(theme.is_ok() && theme.value().compare("Light", Qt::CaseInsensitive) == 0
+                                  ? "Light"
+                                  : "Obsidian");
 
     load_check(chat_bubble_toggle_, "appearance.show_chat_bubble", true);
     load_check(ticker_bar_toggle_, "appearance.show_ticker_bar", true);
@@ -378,6 +431,10 @@ void AppearanceSection::retranslateUi() {
         font_family_label_->setText(tr("Font Family"));
 
     // Theme row + description.
+    if (theme_label_)
+        theme_label_->setText(tr("Color Theme"));
+    if (theme_desc_)
+        theme_desc_->setText(tr("Light uses white surfaces and dark text."));
     if (density_label_)
         density_label_->setText(tr("Content Density"));
     if (density_desc_)

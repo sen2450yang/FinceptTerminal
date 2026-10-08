@@ -914,13 +914,14 @@ int main(int argc, char* argv[]) {
             fincept::StorageManager::instance().start_retention_sweeper();
 
         // Load persisted font settings and apply before any window is shown
-        // — eliminates flash/wrong-font-on-startup. Theme is always Obsidian.
+        // — eliminates flash/wrong-font-on-startup. Unset themes retain Obsidian.
         {
             auto& repo = fincept::SettingsRepository::instance();
             auto& tm = fincept::ui::ThemeManager::instance();
             auto r_family = repo.get("appearance.font_family");
             auto r_size = repo.get("appearance.font_size");
             auto r_density = repo.get("appearance.density");
+            auto r_theme = repo.get("appearance.theme");
             QString family = r_family.is_ok() ? r_family.value() : "Consolas";
             QString size_s = r_size.is_ok() ? r_size.value() : "14px";
             int size_px = size_s.left(size_s.indexOf("px")).toInt();
@@ -935,9 +936,10 @@ int main(int argc, char* argv[]) {
             // qApp->setStyleSheet() (see its docs re: the Plasma 6 / Wayland
             // double-restyle crash, issue #247).
             QString density = r_density.is_ok() && !r_density.value().isEmpty() ? r_density.value() : "Default";
-            tm.apply_typography_and_density(family, size_px, density);
-            tm.apply_theme("Obsidian");
-            LOG_INFO("App", "Theme: Obsidian, font: " + family + " " + size_s + ", density: " + density);
+            QString theme = r_theme.is_ok() && !r_theme.value().isEmpty() ? r_theme.value() : "Obsidian";
+            tm.apply_typography_and_density(family, size_px, density, theme);
+            LOG_INFO("App", "Theme: " + tm.current_theme_name() + ", font: " + family + " " + size_s +
+                                ", density: " + density);
         }
 
         // Load persisted language and install the matching QTranslator before

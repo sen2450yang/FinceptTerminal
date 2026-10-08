@@ -9,7 +9,7 @@ struct ThemeTokens {
     // --- Identity ---
     const char* name;
 
-    // --- Backgrounds (darkest → lightest) ---
+    // --- Backgrounds ---
     const char* bg_base;    // deepest background (#080808 in Obsidian)
     const char* bg_surface; // card / panel surface
     const char* bg_raised;  // slightly elevated surfaces (headers, toolbars)
@@ -61,8 +61,9 @@ struct ThemeTokens {
 };
 
 // ---------------------------------------------------------------------------
-// Built-in theme preset — defined in ThemeManager.cpp
+// Built-in theme presets — defined in ThemeManager.cpp
 // ---------------------------------------------------------------------------
 extern const ThemeTokens THEME_OBSIDIAN;
+extern const ThemeTokens THEME_LIGHT;
 
 } // namespace fincept::ui
